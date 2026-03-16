@@ -1,0 +1,21 @@
+[env:nodemcuv2]
+platform  = espressif8266
+board     = nodemcuv2
+framework = arduino
+
+board_build.filesystem = littlefs
+
+monitor_speed = 115200
+upload_speed  = 921600
+
+lib_deps =
+    tzapu/WiFiManager @ ^2.0.17
+    knolleary/PubSubClient @ ^2.8
+    sciosense/ScioSense_ENS16x @ ^2.0.5
+    adafruit/Adafruit AHTX0 @ ^2.0.5
+    adafruit/Adafruit Unified Sensor @ ^1.1.14
+    bblanchon/ArduinoJson @ ^7.0.4
+
+[env:nodemcuv2_ota]
+extends         = env:nodemcuv2
+upload_protocol = espota

@@ -1,0 +1,108 @@
+# configuration.yaml – Home Assistant MQTT
+# ENS160+AHT21 – AQI / TVOC / eCO₂ / Temperatura / Humedad
+
+mqtt:
+  sensor:
+    - name: "Extractor – AQI"
+      unique_id: extractor_s1_aqi
+      state_topic: "extractor/s1/aqi"
+      availability_topic: "extractor/status"
+      icon: mdi:air-filter
+
+    - name: "Extractor – TVOC"
+      unique_id: extractor_s1_tvoc
+      state_topic: "extractor/s1/tvoc"
+      availability_topic: "extractor/status"
+      unit_of_measurement: "ppb"
+      icon: mdi:molecule
+
+    - name: "Extractor – eCO₂"
+      unique_id: extractor_s1_eco2
+      state_topic: "extractor/s1/eco2"
+      availability_topic: "extractor/status"
+      unit_of_measurement: "ppm"
+      device_class: carbon_dioxide
+
+    - name: "Extractor – Humedad"
+      unique_id: extractor_s2_humidity
+      state_topic: "extractor/s2/humidity"
+      availability_topic: "extractor/status"
+      unit_of_measurement: "%"
+      device_class: humidity
+
+    - name: "Extractor – Temperatura"
+      unique_id: extractor_s2_temp
+      state_topic: "extractor/s2/temperature"
+      availability_topic: "extractor/status"
+      unit_of_measurement: "°C"
+      device_class: temperature
+
+    - name: "Extractor – Estado timer"
+      unique_id: extractor_timer_status
+      state_topic: "extractor/timer/status"
+      availability_topic: "extractor/status"
+      icon: mdi:timer-outline
+
+  switch:
+    - name: "Extractor"
+      unique_id: extractor_relay
+      state_topic:   "extractor/relay/state"
+      command_topic: "extractor/relay/set"
+      availability_topic: "extractor/status"
+      payload_on:    "ON"
+      payload_off:   "OFF"
+      icon: mdi:fan
+
+  select:
+    - name: "Extractor modo"
+      unique_id: extractor_mode
+      state_topic:   "extractor/mode/state"
+      command_topic: "extractor/mode/set"
+      availability_topic: "extractor/status"
+      options:
+        - AUTO
+        - MANUAL
+
+  number:
+    - name: "Umbral AQI"
+      unique_id: extractor_thresh1
+      state_topic:   "extractor/cfg/thresh1/state"
+      command_topic: "extractor/cfg/thresh1/set"
+      availability_topic: "extractor/status"
+      min: 1
+      max: 5
+      step: 1
+      icon: mdi:air-filter
+
+    - name: "Umbral humedad"
+      unique_id: extractor_thresh2
+      state_topic:   "extractor/cfg/thresh2/state"
+      command_topic: "extractor/cfg/thresh2/set"
+      availability_topic: "extractor/status"
+      min: 0
+      max: 100
+      step: 1
+      unit_of_measurement: "%"
+      icon: mdi:water-percent
+
+    - name: "Timer encendido máx. (min)"
+      unique_id: extractor_timer_on
+      state_topic:   "extractor/cfg/timer_on/state"
+      command_topic: "extractor/cfg/timer_on/set"
+      availability_topic: "extractor/status"
+      min: 0
+      max: 1440
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-play-outline
+
+    - name: "Timer cooldown (min)"
+      unique_id: extractor_timer_off
+      state_topic:   "extractor/cfg/timer_off/state"
+      command_topic: "extractor/cfg/timer_off/set"
+      availability_topic: "extractor/status"
+      min: 0
+      max: 1440
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-pause-outline
