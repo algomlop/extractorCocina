@@ -37,6 +37,8 @@
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
 #include <ArduinoOTA.h>
+#include <ESP8266mDNS.h>
+#include "include/secrets.h"
 
 /* ─── Pins ────────────────────────────────────────────────────
  * I2C usa D1(SCL/GPIO5) y D2(SDA/GPIO4) — pines Wire por defecto.
@@ -102,6 +104,8 @@
 
 #define ENS160_I2C_ADDRESS 0x52
 
+#define PIN_SOIL_VCC D6 // GPIO12 — alimentación del sensor
+
 /* ─── Objetos ─────────────────────────────────────────────────*/
 ENS160 ens160;
 Adafruit_AHTX0 aht;
@@ -118,6 +122,9 @@ float gHumidity = 0.0f; // % humedad relativa aire (AHT21)
 float gTemp = 0.0f;     // °C (AHT21)
 float gSoilHum = 0.0f;  // % humedad suelo (A0)
 
+bool gAHTok = false; 
+bool gENSok = false; 
+
 /* ─── Control extractor ───────────────────────────────────────*/
 bool gExtractor = false;
 bool gAutoMode = true;
@@ -133,11 +140,11 @@ unsigned long tCooldownStart = 0;
 bool gInCooldown = false;
 
 /* ─── Config MQTT ─────────────────────────────────────────────*/
-char cfgHost[64] = "";
-char cfgPort[6] = "8883";
-char cfgUser[32] = "";
-char cfgPass[32] = "";
-bool needSave = false;
+char cfgHost[64] = SECRET_MQTT_HOST;
+char cfgPort[6] = SECRET_MQTT_PORT;
+char cfgUser[32] = SECRET_MQTT_USER;
+char cfgPass[32] = SECRET_MQTT_PASS;
+
 
 /* ─── Timers globales ─────────────────────────────────────────*/
 unsigned long tSensor = 0;
@@ -156,16 +163,16 @@ void loadConfig()
         Serial.println(F("LittleFS error"));
         return;
     }
+    //borrado /cfg.json
+    //LittleFS.remove("/cfg.json");
+
     File f = LittleFS.open("/cfg.json", "r");
     if (!f)
         return;
     JsonDocument doc;
     if (deserializeJson(doc, f) == DeserializationError::Ok)
     {
-        strlcpy(cfgHost, doc["h"] | "", sizeof(cfgHost));
-        strlcpy(cfgPort, doc["p"] | "1883", sizeof(cfgPort));
-        strlcpy(cfgUser, doc["u"] | "", sizeof(cfgUser));
-        strlcpy(cfgPass, doc["w"] | "", sizeof(cfgPass));
+
         gThresh1 = doc["t1"] | 3.0f;
         gThresh2 = doc["t2"] | 80.0f;
         gThresh3 = doc["t3"] | 60.0f;
@@ -184,10 +191,6 @@ void saveConfig()
     if (!f)
         return;
     JsonDocument doc;
-    doc["h"] = cfgHost;
-    doc["p"] = cfgPort;
-    doc["u"] = cfgUser;
-    doc["w"] = cfgPass;
     doc["t1"] = gThresh1;
     doc["t2"] = gThresh2;
     doc["t3"] = gThresh3;
@@ -283,43 +286,53 @@ void evaluateAuto()
 void readSensors()
 {
     /* 1. AHT21 primero – sus datos se usan para compensar el ENS160 */
-    sensors_event_t evtHum, evtTemp;
-    if (aht.getEvent(&evtHum, &evtTemp))
-    {
-        if (!isnan(evtTemp.temperature))
-            gTemp = evtTemp.temperature;
-        if (!isnan(evtHum.relative_humidity))
-            gHumidity = evtHum.relative_humidity;
-        ens160.writeCompensation(gTemp, gHumidity);
-    }
-    else
-    {
-        Serial.println(F("[AHT21] error de lectura."));
+    if (gAHTok) {
+
+        sensors_event_t evtHum, evtTemp;
+        if (aht.getEvent(&evtHum, &evtTemp))
+        {
+            if (!isnan(evtTemp.temperature))
+                gTemp = evtTemp.temperature;
+            if (!isnan(evtHum.relative_humidity))
+                gHumidity = evtHum.relative_humidity;
+            ens160.writeCompensation(gTemp, gHumidity);
+        }
+        else
+        {
+            Serial.println(F("[AHT21] error de lectura."));
+        }
     }
 
     /* 2. ENS160 */
-    ens160.wait();
-    if (ens160.update() == RESULT_OK)
-    {
-        if (ens160.hasNewData())
+    if (gENSok) {
+        ens160.wait();
+        if (ens160.update() == RESULT_OK)
         {
-            gAQI = ens160.getAirQualityIndex_UBA();
-            gTVOC = ens160.getTvoc();
-            gECO2 = ens160.getEco2();
-            gENSValid = true;
+            if (ens160.hasNewData())
+            {
+                gAQI = ens160.getAirQualityIndex_UBA();
+                gTVOC = ens160.getTvoc();
+                gECO2 = ens160.getEco2();
+                gENSValid = true;
+            }
         }
-    }
-    else
-    {
-        Serial.println(F("[ENS160] error de lectura."));
-        gENSValid = false;
+        else
+        {
+            Serial.println(F("[ENS160] error de lectura."));
+            gENSValid = false;
+        }
     }
 
     /* 3. Sensor humedad suelo (A0, capacitivo)
      *  El ADC del NodeMCU v2 mide 0–3,3 V → valores 0–1023.
      *  El sensor capacitivo da voltaje ALTO en seco y BAJO en húmedo.
      *  Mapeamos inversamente: 100 % = muy húmedo, 0 % = seco.         */
+
+    analogWrite(PIN_SOIL_VCC, 128); // PWM 50% duty cycle
+    delay(200);           // dejar estabilizar el filtro RC
     int raw = analogRead(PIN_SOIL);
+    digitalWrite(PIN_SOIL_VCC, LOW); // apagar inmediatamente
+
     int clampedRaw = constrain(raw, SOIL_WET, SOIL_DRY);
     gSoilHum = 100.0f * (SOIL_DRY - clampedRaw) / (float)(SOIL_DRY - SOIL_WET);
 
@@ -337,8 +350,7 @@ void publishAll()
 {
     if (!mqtt.connected())
         return;
-    Serial.printf_P(PSTR("[MEM] heap: %u B fragmentación: %u%%\n"),
-                    ESP.getFreeHeap(), ESP.getHeapFragmentation());
+   
     char buf[12];
 
     auto pubF = [&](const char *t, float v, uint8_t dec = 1)
@@ -433,6 +445,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int len)
    ══════════════════════════════════════════════════════════ */
 bool mqttReconnect()
 {
+   
     if (mqtt.connected())
         return true;
     unsigned long now = millis();
@@ -701,11 +714,26 @@ void handleSet()
    ══════════════════════════════════════════════════════════ */
 void setupOTA()
 {
+    if (!MDNS.begin("extractor-esp"))
+    { 
+        Serial.println("Error configurando mDNS");
+    }
+    else
+    {
+        Serial.println("mDNS configurado: extractor-esp");
+    }
+
+
+
     ArduinoOTA.setHostname("extractor-esp");
     ArduinoOTA.onStart([]()
-                       { Serial.println(F("OTA: inicio")); });
+                       {
+    WiFi.setSleepMode(WIFI_NONE_SLEEP); // radio siempre activa durante OTA
+    Serial.println(F("OTA: inicio")); });
     ArduinoOTA.onEnd([]()
-                     { Serial.println(F("\nOTA: fin")); });
+                     {
+    WiFi.setSleepMode(WIFI_MODEM_SLEEP); // vuelve a dormir al terminar
+    Serial.println(F("\nOTA: fin")); });
     ArduinoOTA.onError([](ota_error_t e)
                        { Serial.printf_P(PSTR("OTA error [%u]\n"), e); });
     ArduinoOTA.begin();
@@ -715,18 +743,22 @@ void setupOTA()
 /* ══════════════════════════════════════════════════════════
    Setup
    ══════════════════════════════════════════════════════════ */
-void saveConfigCallback() { needSave = true; }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println(F("\n=== Extractor ESP8266 ==="));
 
+    pinMode(PIN_SOIL_VCC, OUTPUT);
+    digitalWrite(PIN_SOIL_VCC, LOW);
+    analogWriteFreq(500000); // 500 kHz en ESP8266
+
     /* ── Relay: forzar OFF físicamente antes de cualquier otra init.
      * Con RELAY_OFF = HIGH (bobina en reposo) → contacto NO abierto
      * → extractor desconectado. Fail-safe real.                      */
     pinMode(PIN_RELAY, OUTPUT);
     digitalWrite(PIN_RELAY, RELAY_OFF);
+
     gExtractor = false;
 
     /* ── A0 no necesita pinMode() en ESP8266 (solo entrada ADC)      */
@@ -735,60 +767,23 @@ void setup()
      * Wire.begin() sin argumentos: SDA=D2(GPIO4), SCL=D1(GPIO5)   */
     Wire.begin();
 
-    /* ── ENS160 ───────────────────────────────────────────────── */
-    ens160.begin(&Wire, ENS160_I2C_ADDRESS);
 
-    Serial.println(F("begin ens160.."));
-    int retries = 0;
-    while (ens160.init() != true && retries < 500)
-    {
-        Serial.print(F("."));
-        delay(1000);
-        retries++;
-    }
-    if (retries >= 500)
-    {
-        Serial.println(F("Error: ENS160 no responde. Iniciando sin sensor."));
-    }
-    else
-    {
-        Serial.println(F("success"));
-    }
-
-    /* ── AHT21 ────────────────────────────────────────────────── */
-    if (!aht.begin())
-    {
-        Serial.println(F("[AHT21] no encontrado – verifica cableado I2C."));
-    }
-    else
-    {
-        Serial.println(F("[AHT21] OK."));
-    }
-
+    
     loadConfig();
 
     /* ── WiFiManager ─────────────────────────────────────────────*/
     WiFi.persistent(false);
-
+    WiFi.hostname("extractor-esp");
     /* D3 pulsado en boot → forzar portal de configuración        */
     pinMode(PIN_CFG_FORCE, INPUT_PULLUP);
     bool forcePortal = (digitalRead(PIN_CFG_FORCE) == LOW);
     if (forcePortal)
         Serial.println(F("PIN_CFG_FORCE activo → forzando portal WiFi."));
 
-    WiFiManagerParameter pHost("h", "MQTT Host", cfgHost, 63);
-    WiFiManagerParameter pPort("p", "MQTT Port", cfgPort, 5);
-    WiFiManagerParameter pUser("u", "MQTT User", cfgUser, 31);
-    WiFiManagerParameter pPass("w", "MQTT Pass", cfgPass, 31);
 
-    { // bloque para destruir wm en cuanto ya no hace falta
-        WiFiManager wm;
-        wm.addParameter(&pHost);
-        wm.addParameter(&pPort);
-        wm.addParameter(&pUser);
-        wm.addParameter(&pPass);
-        wm.setSaveConfigCallback(saveConfigCallback);
+        WiFiManager wm;        
         wm.setConfigPortalTimeout(180);
+        wm.setHostname("extractor-esp");
 
         bool connected;
         if (forcePortal)
@@ -807,15 +802,7 @@ void setup()
             ESP.restart();
         }
 
-        if (needSave)
-        {
-            strlcpy(cfgHost, pHost.getValue(), sizeof(cfgHost));
-            strlcpy(cfgPort, pPort.getValue(), sizeof(cfgPort));
-            strlcpy(cfgUser, pUser.getValue(), sizeof(cfgUser));
-            strlcpy(cfgPass, pPass.getValue(), sizeof(cfgPass));
-            saveConfig();
-        }
-    } // wm se destruye aquí → libera ~10 KB de heap
+
 
     Serial.print(F("WiFi OK: "));
     Serial.println(WiFi.localIP());
@@ -831,17 +818,51 @@ void setup()
     mqtt.setServer(cfgHost, atoi(cfgPort));
     mqtt.setCallback(mqttCallback);
     mqtt.setKeepAlive(60);
-    mqtt.setBufferSize(512);
+    mqtt.setBufferSize(256);
 
     webServer.on("/", handleRoot);
     webServer.on("/api", handleApi);
     webServer.on("/set", handleSet);
     webServer.begin();
 
+    
     setupOTA();
 
-    readSensors();
-    evaluateAuto();
+
+
+    /* ── ENS160 ───────────────────────────────────────────────── */
+    ens160.begin(&Wire, ENS160_I2C_ADDRESS);
+
+    Serial.println(F("begin ens160.."));
+    int retries = 0;
+    while (ens160.init() != true && retries < 20)
+    {
+        Serial.print(F("."));
+        delay(1000);
+        retries++;
+    }
+    gENSok = (retries < 20);
+    if (!gENSok)
+    {
+        Serial.println(F("Error: ENS160 no responde. Iniciando sin sensor."));
+    }
+    else
+    {
+        Serial.println(F("success"));
+    }
+
+    /* ── AHT21 ────────────────────────────────────────────────── */
+    gAHTok = aht.begin();
+    if (!gAHTok)
+    {
+        Serial.println(F("[AHT21] no encontrado – verifica cableado I2C."));
+    }
+    else
+    {
+        Serial.println(F("[AHT21] OK."));
+    }
+
+    tSensor = millis() - INTERVAL_SENSOR;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -869,6 +890,7 @@ void loop()
     }
 
     ArduinoOTA.handle();
+    MDNS.update();
     webServer.handleClient();
     mqttReconnect();
     mqtt.loop();
