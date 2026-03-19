@@ -58,8 +58,8 @@
 #define T_AQI          BASE "/s1/aqi"            // 1–5
 #define T_TVOC         BASE "/s1/tvoc"           // ppb
 #define T_ECO2         BASE "/s1/eco2"           // ppm
-#define T_HUMIDITY     BASE "/s2/humidity"       // %
-#define T_TEMP         BASE "/s2/temperature"    // °C
+#define T_HUMIDITY     BASE "/s1/humidity"       // %
+#define T_TEMP         BASE "/s1/temperature"    // °C
 #define T_STATE        BASE "/relay/state"       // ON|OFF|OFFLINE
 #define T_MODE         BASE "/mode/state"        // AUTO|MANUAL
 #define T_THRESH1      BASE "/cfg/thresh1/state" // AQI umbral (1–5)

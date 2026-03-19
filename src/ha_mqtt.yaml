@@ -24,15 +24,15 @@ mqtt:
       device_class: carbon_dioxide
 
     - name: "Extractor – Humedad"
-      unique_id: extractor_s2_humidity
-      state_topic: "extractor/s2/humidity"
+      unique_id: extractor_s1_humidity
+      state_topic: "extractor/s1/humidity"
       availability_topic: "extractor/status"
       unit_of_measurement: "%"
       device_class: humidity
 
     - name: "Extractor – Temperatura"
-      unique_id: extractor_s2_temp
-      state_topic: "extractor/s2/temperature"
+      unique_id: extractor_s1_temp
+      state_topic: "extractor/s1/temperature"
       availability_topic: "extractor/status"
       unit_of_measurement: "°C"
       device_class: temperature
