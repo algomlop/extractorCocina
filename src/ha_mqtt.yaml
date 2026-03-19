@@ -1,5 +1,6 @@
 # configuration.yaml – Home Assistant MQTT
 # ENS160+AHT21 – AQI / TVOC / eCO₂ / Temperatura / Humedad
+# Sensor capacitivo de humedad de suelo (A0)
 
 mqtt:
   sensor:
@@ -36,6 +37,15 @@ mqtt:
       availability_topic: "extractor/status"
       unit_of_measurement: "°C"
       device_class: temperature
+
+    - name: "Extractor – Humedad suelo"
+      unique_id: extractor_s2_soil
+      state_topic: "extractor/s2/soil"
+      availability_topic: "extractor/status"
+      unit_of_measurement: "%"
+      icon: mdi:water-circle
+      # 0 % = seco  /  100 % = húmedo
+      # Sensor capacitivo conectado al pin A0 del NodeMCU v2.
 
     - name: "Extractor – Estado timer"
       unique_id: extractor_timer_status
@@ -74,7 +84,7 @@ mqtt:
       step: 1
       icon: mdi:air-filter
 
-    - name: "Umbral humedad"
+    - name: "Umbral humedad aire"
       unique_id: extractor_thresh2
       state_topic:   "extractor/cfg/thresh2/state"
       command_topic: "extractor/cfg/thresh2/set"
@@ -84,6 +94,19 @@ mqtt:
       step: 1
       unit_of_measurement: "%"
       icon: mdi:water-percent
+
+    - name: "Umbral humedad suelo"
+      unique_id: extractor_thresh3
+      state_topic:   "extractor/cfg/thresh3/state"
+      command_topic: "extractor/cfg/thresh3/set"
+      availability_topic: "extractor/status"
+      min: 0
+      max: 100
+      step: 1
+      unit_of_measurement: "%"
+      icon: mdi:water-circle
+      # Encender extractor cuando la humedad del suelo supere este umbral.
+      # Útil para detectar riego y gestionar la humedad ambiental resultante.
 
     - name: "Timer encendido máx. (min)"
       unique_id: extractor_timer_on

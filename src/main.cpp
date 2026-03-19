@@ -9,20 +9,26 @@
  *   ENS160 @ 0x52 → AQI (1–5) / TVOC (ppb) / eCO₂ (ppm)
  *   AHT21  @ 0x38 → Temperatura (°C) / Humedad relativa (%)
  *
- * D5 → Relay IN (GPIO14) – NC active-low
- *   PIN HIGH → bobina en reposo → NC cerrado → extractor ON
- *   PIN LOW  → bobina activada  → NC abierto → extractor OFF
+ * D5 → Relay IN (GPIO14) – NO active-low  ← usa contacto Normalmente Abierto
+ *   PIN LOW  → bobina activada  → NO cerrado → extractor ON
+ *   PIN HIGH → bobina en reposo → NO abierto → extractor OFF  (fail-safe)
+ *
+ * A0 → Sensor humedad suelo (capacitivo, 0–3,3 V):
+ *   Raw alto (~820) = seco  →  0 % humedad suelo
+ *   Raw bajo (~380) = húmedo → 100 % humedad suelo
+ *   Calibrar SOIL_DRY / SOIL_WET según tu sensor específico.
  *
  * Lógica de disparo (modo AUTO):
- *   ENCENDER: AQI >= thresh1  O  Humedad >= thresh2
- *   APAGAR:   AQI <  thresh1  Y  Humedad < (thresh2 - HYST_HUM)
- *   Si ENS160 aún está calentando, solo la humedad actúa como disparador.
- *
+ *   ENCENDER: AQI >= thresh1  O  Humedad_aire >= thresh2  O  Suelo >= thresh3
+ *   APAGAR:   AQI <  thresh1  Y  Humedad_aire < (thresh2 - HYST_HUM)
+ *                              Y  Suelo < (thresh3 - HYST_SOIL)
+ *   Si ENS160 aún está calentando, el AQI se ignora.
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ScioSense_ENS16x.h>
@@ -32,217 +38,269 @@
 #include <LittleFS.h>
 #include <ArduinoOTA.h>
 
-/* ─── Pins ───────────────────────────────────────────────────
+/* ─── Pins ────────────────────────────────────────────────────
  * I2C usa D1(SCL/GPIO5) y D2(SDA/GPIO4) — pines Wire por defecto.
- * El relay SE MOVIÓ de D1 a D5 para liberar el bus I2C.          */
-#define PIN_RELAY D5            // GPIO14
+ * El relay está en D5 para liberar el bus I2C.
+ * A0 es el único pin ADC del NodeMCU v2.                        */
+#define PIN_RELAY D5     // GPIO14
+#define PIN_SOIL A0      // ADC – sensor humedad suelo (capacitivo)
+#define PIN_CFG_FORCE D3 // GPIO0 – mantener pulsado en boot para forzar portal WiFiManager
 
-/* ─── Relay NC active-low ─────────────────────────────────── */
-#define RELAY_ON   HIGH         // bobina en reposo → NC cerrado → ON
-#define RELAY_OFF  LOW          // bobina activada  → NC abierto → OFF
+/* ─── Relay NO active-low (fail-safe) ─────────────────────────
+ *  Usando el contacto NO del módulo relé con lógica active-low.
+ *  En reposo (HIGH / sin energía) la bobina está desactivada,
+ *  el contacto NO permanece ABIERTO → extractor OFF.
+ *  Ventaja: un fallo del ESP o un reset nunca enciende el motor. */
+#define RELAY_ON LOW   // bobina activada  → NO cerrado → extractor ON
+#define RELAY_OFF HIGH // bobina en reposo → NO abierto → extractor OFF
 
-/* ─── Histéresis ──────────────────────────────────────────── */
-// AQI es entero 1–5; el ENS160 filtra internamente, sin histéresis extra.
-// La humedad sí usa ±5 % para evitar chatter.
-#define HYST_HUM  5.0f
+/* ─── Calibración sensor suelo ────────────────────────────────
+ *  Ajusta estos valores midiendo con tu sensor:
+ *    analogRead() con el sensor en aire seco  → SOIL_DRY
+ *    analogRead() con el sensor sumergido     → SOIL_WET */
+#define SOIL_DRY 820 // ADC raw ~ suelo completamente seco
+#define SOIL_WET 380 // ADC raw ~ suelo completamente húmedo
 
-/* ─── Intervalos ──────────────────────────────────────────── */
-#define INTERVAL_SENSOR      10000UL  // leer sensores cada 10 s
-#define INTERVAL_MQTT        15000UL  // publicar MQTT cada 15 s
-#define INTERVAL_RECONNECT    5000UL  // reintentar conexión MQTT cada 5 s
-#define INTERVAL_WIFI_WDT   120000UL  // reiniciar si WiFi caído > 2 min
+/* ─── Histéresis ──────────────────────────────────────────────
+ *  Evita chatter en los disparadores de humedad.               */
+#define HYST_HUM 5.0f  // ±5 % humedad aire
+#define HYST_SOIL 5.0f // ±5 % humedad suelo
 
-/* ─── MQTT topics ─────────────────────────────────────────── */
+/* ─── Intervalos ──────────────────────────────────────────────*/
+#define INTERVAL_SENSOR 10000UL    // leer sensores cada 10 s
+#define INTERVAL_MQTT 60000UL      // publicar MQTT cada 60 s
+#define INTERVAL_RECONNECT 5000UL  // reintentar conexión MQTT cada 5 s
+#define INTERVAL_WIFI_WDT 120000UL // reiniciar si WiFi caído > 2 min
+
+/* ─── MQTT topics ─────────────────────────────────────────────*/
 #define BASE "extractor"
 // ← Publicar
-#define T_AQI          BASE "/s1/aqi"            // 1–5
-#define T_TVOC         BASE "/s1/tvoc"           // ppb
-#define T_ECO2         BASE "/s1/eco2"           // ppm
-#define T_HUMIDITY     BASE "/s1/humidity"       // %
-#define T_TEMP         BASE "/s1/temperature"    // °C
-#define T_STATE        BASE "/relay/state"       // ON|OFF|OFFLINE
-#define T_MODE         BASE "/mode/state"        // AUTO|MANUAL
-#define T_THRESH1      BASE "/cfg/thresh1/state" // AQI umbral (1–5)
-#define T_THRESH2      BASE "/cfg/thresh2/state" // Humedad umbral (%)
-#define T_TIMER_ON     BASE "/cfg/timer_on/state"
-#define T_TIMER_OFF    BASE "/cfg/timer_off/state"
-#define T_TIMER_STATUS BASE "/timer/status"      // IDLE|ON_TIMER|COOLDOWN
+#define T_AQI BASE "/s1/aqi"                // 1–5
+#define T_TVOC BASE "/s1/tvoc"              // ppb
+#define T_ECO2 BASE "/s1/eco2"              // ppm
+#define T_HUMIDITY BASE "/s1/humidity"      // % aire
+#define T_TEMP BASE "/s1/temperature"       // °C
+#define T_SOIL BASE "/s2/soil"              // % humedad suelo
+#define T_STATE BASE "/relay/state"         // ON|OFF
+#define T_MODE BASE "/mode/state"           // AUTO|MANUAL
+#define T_THRESH1 BASE "/cfg/thresh1/state" // AQI umbral (1–5)
+#define T_THRESH2 BASE "/cfg/thresh2/state" // Humedad aire %
+#define T_THRESH3 BASE "/cfg/thresh3/state" // Humedad suelo %
+#define T_TIMER_ON BASE "/cfg/timer_on/state"
+#define T_TIMER_OFF BASE "/cfg/timer_off/state"
+#define T_TIMER_STATUS BASE "/timer/status" // IDLE|ON_TIMER|COOLDOWN
 // → Comandos (suscribir)
-#define T_SET_RELAY     BASE "/relay/set"
-#define T_SET_MODE      BASE "/mode/set"
-#define T_SET_THRESH1   BASE "/cfg/thresh1/set"
-#define T_SET_THRESH2   BASE "/cfg/thresh2/set"
-#define T_SET_TIMER_ON  BASE "/cfg/timer_on/set"
+#define T_SET_RELAY BASE "/relay/set"
+#define T_SET_MODE BASE "/mode/set"
+#define T_SET_THRESH1 BASE "/cfg/thresh1/set"
+#define T_SET_THRESH2 BASE "/cfg/thresh2/set"
+#define T_SET_THRESH3 BASE "/cfg/thresh3/set"
+#define T_SET_TIMER_ON BASE "/cfg/timer_on/set"
 #define T_SET_TIMER_OFF BASE "/cfg/timer_off/set"
 
-
-#define T_STATUS BASE "/status"   
+#define T_STATUS BASE "/status"
 
 #define ENS160_I2C_ADDRESS 0x52
 
-/* ─── Objetos ─────────────────────────────────────────────── */
+/* ─── Objetos ─────────────────────────────────────────────────*/
 ENS160 ens160;
-
 Adafruit_AHTX0 aht;
-WiFiClient        wifiClient;
-PubSubClient      mqtt(wifiClient);
-ESP8266WebServer  webServer(80);
+BearSSL::WiFiClientSecure wifiClient;
+PubSubClient mqtt(wifiClient);
+ESP8266WebServer webServer(80);
 
-/* ─── Estado sensores ─────────────────────────────────────── */
-uint8_t  gAQI        = 1;
-uint16_t gTVOC       = 0;
-uint16_t gECO2       = 400;
-bool     gENSValid   = false;   // true solo cuando ENS160 reporta NORMAL
-float    gHumidity   = 0.0f;
-float    gTemp       = 0.0f;
+/* ─── Estado sensores ─────────────────────────────────────────*/
+uint8_t gAQI = 1;
+uint16_t gTVOC = 0;
+uint16_t gECO2 = 400;
+bool gENSValid = false; // true solo cuando ENS160 reporta NORMAL
+float gHumidity = 0.0f; // % humedad relativa aire (AHT21)
+float gTemp = 0.0f;     // °C (AHT21)
+float gSoilHum = 0.0f;  // % humedad suelo (A0)
 
-/* ─── Control extractor ───────────────────────────────────── */
-bool     gExtractor  = false;
-bool     gAutoMode   = true;
-float    gThresh1    = 3.0f;   // AQI umbral: encender si AQI >= este valor
-float    gThresh2    = 80.0f;  // Humedad %: encender si humedad >= este valor
+/* ─── Control extractor ───────────────────────────────────────*/
+bool gExtractor = false;
+bool gAutoMode = true;
+float gThresh1 = 3.0f;  // AQI umbral: encender si AQI >= este valor
+float gThresh2 = 80.0f; // Humedad aire %: encender si >= este valor
+float gThresh3 = 60.0f; // Humedad suelo %: encender si >= este valor
 
-/* ─── Temporizador ────────────────────────────────────────── */
-uint16_t      gTimerOnMin    = 0;   // 0 = desactivado
-uint16_t      gTimerOffMin   = 0;   // 0 = desactivado
-unsigned long tExtractorOn   = 0;
+/* ─── Temporizador ────────────────────────────────────────────*/
+uint16_t gTimerOnMin = 0;
+uint16_t gTimerOffMin = 0;
+unsigned long tExtractorOn = 0;
 unsigned long tCooldownStart = 0;
-bool          gInCooldown    = false;
+bool gInCooldown = false;
 
-/* ─── Config MQTT ─────────────────────────────────────────── */
+/* ─── Config MQTT ─────────────────────────────────────────────*/
 char cfgHost[64] = "";
-char cfgPort[6]  = "1883";
+char cfgPort[6] = "8883";
 char cfgUser[32] = "";
 char cfgPass[32] = "";
 bool needSave = false;
 
-/* ─── Timers globales ─────────────────────────────────────── */
-unsigned long tSensor    = 0;
-unsigned long tMqtt      = 0;
-unsigned long tRecon     = 0;
-unsigned long tWifiLost  = 0;
-bool          wifiWasLost = false;
+/* ─── Timers globales ─────────────────────────────────────────*/
+unsigned long tSensor = 0;
+unsigned long tMqtt = 0;
+unsigned long tRecon = 0;
+unsigned long tWifiLost = 0;
+bool wifiWasLost = false;
 
 /* ══════════════════════════════════════════════════════════
    LittleFS – carga y guardado de configuración
    ══════════════════════════════════════════════════════════ */
-void loadConfig() {
-    if (!LittleFS.begin()) { Serial.println("LittleFS error"); return; }
+void loadConfig()
+{
+    if (!LittleFS.begin())
+    {
+        Serial.println(F("LittleFS error"));
+        return;
+    }
     File f = LittleFS.open("/cfg.json", "r");
-    if (!f) return;
+    if (!f)
+        return;
     JsonDocument doc;
-    if (deserializeJson(doc, f) == DeserializationError::Ok) {
-        strlcpy(cfgHost, doc["h"] | "",     sizeof(cfgHost));
+    if (deserializeJson(doc, f) == DeserializationError::Ok)
+    {
+        strlcpy(cfgHost, doc["h"] | "", sizeof(cfgHost));
         strlcpy(cfgPort, doc["p"] | "1883", sizeof(cfgPort));
-        strlcpy(cfgUser, doc["u"] | "",     sizeof(cfgUser));
-        strlcpy(cfgPass, doc["w"] | "",     sizeof(cfgPass));
-        gThresh1     = doc["t1"]  | 3.0f;
-        gThresh2     = doc["t2"]  | 80.0f;
-        gTimerOnMin  = doc["ton"] | 0;
+        strlcpy(cfgUser, doc["u"] | "", sizeof(cfgUser));
+        strlcpy(cfgPass, doc["w"] | "", sizeof(cfgPass));
+        gThresh1 = doc["t1"] | 3.0f;
+        gThresh2 = doc["t2"] | 80.0f;
+        gThresh3 = doc["t3"] | 60.0f;
+        gTimerOnMin = doc["ton"] | 0;
         gTimerOffMin = doc["tof"] | 0;
     }
     f.close();
-    Serial.printf("Config OK. MQTT: %s:%s\n", cfgHost, cfgPort);
+    Serial.printf_P(PSTR("Config OK. MQTT: %s:%s\n"), cfgHost, cfgPort);
 }
 
-void saveConfig() {
-    if (!LittleFS.begin()) return;
+void saveConfig()
+{
+    if (!LittleFS.begin())
+        return;
     File f = LittleFS.open("/cfg.json", "w");
-    if (!f) return;
+    if (!f)
+        return;
     JsonDocument doc;
-    doc["h"]   = cfgHost;     doc["p"]   = cfgPort;
-    doc["u"]   = cfgUser;     doc["w"]   = cfgPass;
-    doc["t1"]  = gThresh1;    doc["t2"]  = gThresh2;
-    doc["ton"] = gTimerOnMin; doc["tof"] = gTimerOffMin;
+    doc["h"] = cfgHost;
+    doc["p"] = cfgPort;
+    doc["u"] = cfgUser;
+    doc["w"] = cfgPass;
+    doc["t1"] = gThresh1;
+    doc["t2"] = gThresh2;
+    doc["t3"] = gThresh3;
+    doc["ton"] = gTimerOnMin;
+    doc["tof"] = gTimerOffMin;
     serializeJson(doc, f);
     f.close();
-    Serial.println("Config guardado.");
+    Serial.println(F("Config guardado."));
 }
 
 /* ══════════════════════════════════════════════════════════
    Relay
    ══════════════════════════════════════════════════════════ */
-void setExtractor(bool on) {
-    if (on == gExtractor) return;
+void setExtractor(bool on)
+{
+    if (on == gExtractor)
+        return;
     gExtractor = on;
     digitalWrite(PIN_RELAY, on ? RELAY_ON : RELAY_OFF);
-    if (on) {
+    if (on)
+    {
         tExtractorOn = millis();
-        gInCooldown  = false;
+        gInCooldown = false;
     }
-    Serial.printf("Extractor: %s\n", on ? "ON" : "OFF");
+    Serial.printf_P(PSTR("Extractor: %s\n"), on ? "ON" : "OFF");
 }
 
 /* ══════════════════════════════════════════════════════════
    Lógica automática: histéresis + temporizador
    ══════════════════════════════════════════════════════════ */
-void evaluateAuto() {
-    if (!gAutoMode) return;
+void evaluateAuto()
+{
+    if (!gAutoMode)
+        return;
     unsigned long now = millis();
 
     /* ── Timer: apagado por tiempo máximo encendido ── */
-    if (gExtractor && gTimerOnMin > 0) {
-        if (now - tExtractorOn >= (unsigned long)gTimerOnMin * 60000UL) {
-            Serial.println("Timer ON expirado → apagando.");
+    if (gExtractor && gTimerOnMin > 0)
+    {
+        if (now - tExtractorOn >= (unsigned long)gTimerOnMin * 60000UL)
+        {
+            Serial.println(F("Timer ON expirado → apagando."));
             setExtractor(false);
-            if (gTimerOffMin > 0) {
-                gInCooldown    = true;
+            if (gTimerOffMin > 0)
+            {
+                gInCooldown = true;
                 tCooldownStart = now;
-                Serial.printf("Cooldown: %u min.\n", gTimerOffMin);
+                Serial.printf_P(PSTR("Cooldown: %u min.\n"), gTimerOffMin);
             }
             return;
         }
     }
 
     /* ── Cooldown: espera antes de volver a encender ── */
-    if (gInCooldown) {
+    if (gInCooldown)
+    {
         if (now - tCooldownStart < (unsigned long)gTimerOffMin * 60000UL)
             return;
         gInCooldown = false;
-        Serial.println("Cooldown terminado.");
+        Serial.println(F("Cooldown terminado."));
     }
 
-    /* ── Disparadores ────────────────────────────────────────
-     *  ENCENDER: AQI >= thresh1  O  Humedad >= thresh2
-     *  APAGAR:   AQI <  thresh1  Y  Humedad < (thresh2 - HYST_HUM)
+    /* ── Disparadores ──────────────────────────────────────────
+     *  ENCENDER: AQI >= thresh1  O  Humedad_aire >= thresh2  O  Suelo >= thresh3
+     *  APAGAR:   AQI <  thresh1  Y  Humedad_aire < (thresh2 - HYST_HUM)
+     *                             Y  Suelo < (thresh3 - HYST_SOIL)
      *
      *  gENSValid = false durante WARMUP/INITIAL (~3 min, primer arranque).
-     *  En ese período el AQI se ignora; solo la humedad actúa como
-     *  disparador para evitar falsos positivos con datos no fiables.
-     * ──────────────────────────────────────────────────────── */
+     *  En ese período el AQI se ignora para evitar falsos positivos.
+     * ─────────────────────────────────────────────────────────── */
     bool trigAQI = gENSValid && ((float)gAQI >= gThresh1);
     bool trigHum = (gHumidity >= gThresh2);
+    bool trigSoil = (gSoilHum >= gThresh3);
 
-    if (!gExtractor) {
-        if (trigAQI || trigHum) setExtractor(true);
-    } else {
+    if (!gExtractor)
+    {
+        if (trigAQI || trigHum || trigSoil)
+            setExtractor(true);
+    }
+    else
+    {
         bool okAQI = !gENSValid || ((float)gAQI < gThresh1);
         bool okHum = (gHumidity < gThresh2 - HYST_HUM);
-        if (okAQI && okHum) setExtractor(false);
+        bool okSoil = (gSoilHum < gThresh3 - HYST_SOIL);
+        if (okAQI && okHum && okSoil)
+            setExtractor(false);
     }
 }
 
 /* ══════════════════════════════════════════════════════════
    Sensores
    ══════════════════════════════════════════════════════════ */
-void readSensors() {
+void readSensors()
+{
     /* 1. AHT21 primero – sus datos se usan para compensar el ENS160 */
     sensors_event_t evtHum, evtTemp;
-    if (aht.getEvent(&evtHum, &evtTemp)) {
-        if (!isnan(evtTemp.temperature))      gTemp     = evtTemp.temperature;
-        if (!isnan(evtHum.relative_humidity)) gHumidity = evtHum.relative_humidity;
-        /* Compensación de T y HR mejora precisión de TVOC/eCO₂ */
+    if (aht.getEvent(&evtHum, &evtTemp))
+    {
+        if (!isnan(evtTemp.temperature))
+            gTemp = evtTemp.temperature;
+        if (!isnan(evtHum.relative_humidity))
+            gHumidity = evtHum.relative_humidity;
         ens160.writeCompensation(gTemp, gHumidity);
-    } else {
-        Serial.println("[AHT21] error de lectura.");
     }
-
-    
+    else
+    {
+        Serial.println(F("[AHT21] error de lectura."));
+    }
 
     /* 2. ENS160 */
     ens160.wait();
     if (ens160.update() == RESULT_OK)
-     {
+    {
         if (ens160.hasNewData())
         {
             gAQI = ens160.getAirQualityIndex_UBA();
@@ -251,98 +309,125 @@ void readSensors() {
             gENSValid = true;
         }
     }
-
     else
     {
-        // Opcional: Solo si la comunicación I2C falla catastróficamente
-        // marcamos que el dato ya no es válido.
-        Serial.println("[ENS160] error de lectura.");
+        Serial.println(F("[ENS160] error de lectura."));
         gENSValid = false;
     }
 
+    /* 3. Sensor humedad suelo (A0, capacitivo)
+     *  El ADC del NodeMCU v2 mide 0–3,3 V → valores 0–1023.
+     *  El sensor capacitivo da voltaje ALTO en seco y BAJO en húmedo.
+     *  Mapeamos inversamente: 100 % = muy húmedo, 0 % = seco.         */
+    int raw = analogRead(PIN_SOIL);
+    int clampedRaw = constrain(raw, SOIL_WET, SOIL_DRY);
+    gSoilHum = 100.0f * (SOIL_DRY - clampedRaw) / (float)(SOIL_DRY - SOIL_WET);
 
-    Serial.printf(
-        "ENS160 AQI:%u  TVOC:%u ppb  eCO2:%u ppm | "
-        "AHT21  HR:%.1f%%  T:%.1f°C\n",
-         gAQI, gTVOC, gECO2, gHumidity, gTemp);
+    Serial.printf_P(
+        PSTR("ENS160 AQI:%u  TVOC:%u ppb  eCO2:%u ppm | "
+             "AHT21  HR:%.1f%%  T:%.1f°C | "
+             "Suelo  raw:%d  %.1f%%\n"),
+        gAQI, gTVOC, gECO2, gHumidity, gTemp, raw, gSoilHum);
 }
 
 /* ══════════════════════════════════════════════════════════
    MQTT – publicar todo el estado
    ══════════════════════════════════════════════════════════ */
-void publishAll() {
-    if (!mqtt.connected()) return;
+void publishAll()
+{
+    if (!mqtt.connected())
+        return;
+    Serial.printf_P(PSTR("[MEM] heap: %u B fragmentación: %u%%\n"),
+                    ESP.getFreeHeap(), ESP.getHeapFragmentation());
     char buf[12];
 
-    auto pubF = [&](const char* t, float v, uint8_t dec = 1) {
+    auto pubF = [&](const char *t, float v, uint8_t dec = 1)
+    {
         dtostrf(v, 1, dec, buf);
         mqtt.publish(t, buf, true);
     };
-    auto pubU = [&](const char* t, uint32_t v) {
+    auto pubU = [&](const char *t, uint32_t v)
+    {
         snprintf(buf, sizeof(buf), "%u", v);
         mqtt.publish(t, buf, true);
     };
 
-    pubU(T_AQI,  gAQI);
+    pubU(T_AQI, gAQI);
     pubU(T_TVOC, gTVOC);
     pubU(T_ECO2, gECO2);
 
     pubF(T_HUMIDITY, gHumidity);
-    pubF(T_TEMP,     gTemp);
+    pubF(T_TEMP, gTemp);
+    pubF(T_SOIL, gSoilHum);
 
-    pubF(T_THRESH1, gThresh1, 0);   // AQI sin decimales
+    pubF(T_THRESH1, gThresh1, 0); // AQI sin decimales
     pubF(T_THRESH2, gThresh2);
+    pubF(T_THRESH3, gThresh3);
 
-    pubU(T_TIMER_ON,  gTimerOnMin);
+    pubU(T_TIMER_ON, gTimerOnMin);
     pubU(T_TIMER_OFF, gTimerOffMin);
 
-    mqtt.publish(T_STATE, gExtractor ? "ON"   : "OFF",    true);
-    mqtt.publish(T_MODE,  gAutoMode  ? "AUTO" : "MANUAL", true);
+    mqtt.publish(T_STATE, gExtractor ? "ON" : "OFF", true);
+    mqtt.publish(T_MODE, gAutoMode ? "AUTO" : "MANUAL", true);
 
-    const char* ts = gInCooldown                     ? "COOLDOWN"
-                   : (gExtractor && gTimerOnMin > 0) ? "ON_TIMER"
-                   : "IDLE";
+    const char *ts = gInCooldown                       ? "COOLDOWN"
+                     : (gExtractor && gTimerOnMin > 0) ? "ON_TIMER"
+                                                       : "IDLE";
     mqtt.publish(T_TIMER_STATUS, ts, true);
 }
 
 /* ══════════════════════════════════════════════════════════
    MQTT – callback de comandos entrantes
    ══════════════════════════════════════════════════════════ */
-void mqttCallback(char* topic, byte* payload, unsigned int len) {
+void mqttCallback(char *topic, byte *payload, unsigned int len)
+{
     char msg[64] = {0};
     memcpy(msg, payload, min(len, (unsigned int)63));
-    Serial.printf("MQTT ← [%s]: %s\n", topic, msg);
+    Serial.printf_P(PSTR("MQTT ← [%s]: %s\n"), topic, msg);
 
-    if (strcmp(topic, T_SET_RELAY) == 0) {
-        gAutoMode = false; gInCooldown = false;
+    if (strcmp(topic, T_SET_RELAY) == 0)
+    {
+        gAutoMode = false;
+        gInCooldown = false;
         setExtractor(strcmp(msg, "ON") == 0);
-
-    } else if (strcmp(topic, T_SET_MODE) == 0) {
+    }
+    else if (strcmp(topic, T_SET_MODE) == 0)
+    {
         gAutoMode = (strcmp(msg, "AUTO") == 0);
-        if (gAutoMode) evaluateAuto();
-
-    } else if (strcmp(topic, T_SET_THRESH1) == 0) {
+        if (gAutoMode)
+            evaluateAuto();
+    }
+    else if (strcmp(topic, T_SET_THRESH1) == 0)
+    {
         gThresh1 = constrain(atof(msg), 1.0f, 5.0f);
-        saveConfig(); evaluateAuto();
-
-    } else if (strcmp(topic, T_SET_THRESH2) == 0) {
+        saveConfig();
+        evaluateAuto();
+    }
+    else if (strcmp(topic, T_SET_THRESH2) == 0)
+    {
         gThresh2 = constrain(atof(msg), 0.0f, 100.0f);
-        saveConfig(); evaluateAuto();
-
-    } else if (strcmp(topic, T_SET_TIMER_ON) == 0) {
+        saveConfig();
+        evaluateAuto();
+    }
+    else if (strcmp(topic, T_SET_THRESH3) == 0)
+    {
+        gThresh3 = constrain(atof(msg), 0.0f, 100.0f);
+        saveConfig();
+        evaluateAuto();
+    }
+    else if (strcmp(topic, T_SET_TIMER_ON) == 0)
+    {
         gTimerOnMin = (uint16_t)constrain(atoi(msg), 0, 1440);
         saveConfig();
-
-    } else if (strcmp(topic, T_SET_TIMER_OFF) == 0) {
+    }
+    else if (strcmp(topic, T_SET_TIMER_OFF) == 0)
+    {
         gTimerOffMin = (uint16_t)constrain(atoi(msg), 0, 1440);
         saveConfig();
     }
     publishAll();
 }
 
-/* ══════════════════════════════════════════════════════════
-   MQTT – reconexión (no bloqueante)
-   ══════════════════════════════════════════════════════════ */
 /* ══════════════════════════════════════════════════════════
    MQTT – reconexión (no bloqueante)
    ══════════════════════════════════════════════════════════ */
@@ -357,35 +442,33 @@ bool mqttReconnect()
     if (cfgHost[0] == '\0')
         return false;
 
-    Serial.printf("MQTT → %s:%s  (heap: %u B)…\n", cfgHost, cfgPort, ESP.getFreeHeap());
+    Serial.printf_P(PSTR("MQTT → %s:%s  (heap: %u B)…\n"), cfgHost, cfgPort, ESP.getFreeHeap());
     String cid = "esp-ext-" + String(ESP.getChipId(), HEX);
 
-    // Aquí está el cambio del LWT:
     bool ok = mqtt.connect(
         cid.c_str(),
         cfgUser[0] ? cfgUser : nullptr,
         cfgPass[0] ? cfgPass : nullptr,
-        T_STATUS, 0, true, "offline", // LWT: si desconecta → "offline"
-        true
-    );
+        T_STATUS, 0, true, "offline",
+        true);
 
     if (ok)
     {
-        Serial.println("MQTT OK.");
-        // Publicamos que estamos vivos
+        Serial.println(F("MQTT OK."));
         mqtt.publish(T_STATUS, "online", true);
 
         mqtt.subscribe(T_SET_RELAY);
         mqtt.subscribe(T_SET_MODE);
         mqtt.subscribe(T_SET_THRESH1);
         mqtt.subscribe(T_SET_THRESH2);
+        mqtt.subscribe(T_SET_THRESH3);
         mqtt.subscribe(T_SET_TIMER_ON);
         mqtt.subscribe(T_SET_TIMER_OFF);
         publishAll();
     }
     else
     {
-        Serial.printf("MQTT error %d\n", mqtt.state());
+        Serial.printf_P(PSTR("MQTT error %d\n"), mqtt.state());
     }
     return ok;
 }
@@ -417,11 +500,14 @@ const char HTML[] PROGMEM = R"html(
   .lbl{color:#666;font-size:.88em}
   .tbox{background:#f5f5f5;border-radius:8px;padding:8px 10px;margin-top:8px}
   .note{font-size:.8em;color:#999;margin:4px 0 8px}
+  /* Barra de humedad suelo */
+  .soil-bar-wrap{flex:1;margin:0 10px;height:10px;background:#e0e0e0;border-radius:5px;overflow:hidden}
+  .soil-bar{height:100%;border-radius:5px;transition:width .6s,background .6s}
 </style></head><body>
 <h2>Extractor</h2>
 
 <div class="card">
-  <h3>Calidad del aire &nbsp;</h3>
+  <h3>Calidad del aire</h3>
   <div class="row"><span class="lbl">🏭 AQI (1–5)</span><span id="vaqi" class="val">–</span></div>
   <div class="row"><span class="lbl">💨 TVOC</span><span class="val" id="vtvoc">–</span></div>
   <div class="row"><span class="lbl">☁️ eCO₂</span><span class="val" id="veco2">–</span></div>
@@ -431,6 +517,16 @@ const char HTML[] PROGMEM = R"html(
   <h3>Ambiente</h3>
   <div class="row"><span class="lbl">💦 Humedad</span><span class="val" id="vhum">–</span></div>
   <div class="row"><span class="lbl">🌡️ Temperatura</span><span class="val" id="vtemp">–</span></div>
+</div>
+
+<div class="card">
+  <h3>🪴 Humedad de suelo</h3>
+  <div class="row">
+    <span class="lbl">Suelo</span>
+    <div class="soil-bar-wrap"><div class="soil-bar" id="soil-bar" style="width:0%"></div></div>
+    <span class="val" id="vsoil">–</span>
+  </div>
+  <p class="note" style="margin-top:6px">Calibrar SOIL_DRY / SOIL_WET en el firmware según tu sensor.</p>
 </div>
 
 <div class="card">
@@ -447,16 +543,21 @@ const char HTML[] PROGMEM = R"html(
 </div>
 
 <div class="card">
-  <h3>Umbrales <span style="font-weight:400;color:#aaa;font-size:.85em">(Humedad ±5% histéresis)</span></h3>
+  <h3>Umbrales <span style="font-weight:400;color:#aaa;font-size:.85em">(±5 % histéresis en humedad)</span></h3>
   <div class="row">
     <span class="lbl">AQI mín. (1–5)</span>
     <span><input type="number" id="t1" min="1" max="5" step="1">
           <button onclick="setV('t1')">✓</button></span>
   </div>
   <div class="row">
-    <span class="lbl">Humedad mín.</span>
+    <span class="lbl">Humedad aire mín.</span>
     <span><input type="number" id="t2" min="0" max="100">%
           <button onclick="setV('t2')">✓</button></span>
+  </div>
+  <div class="row">
+    <span class="lbl">🪴 Humedad suelo mín.</span>
+    <span><input type="number" id="t3" min="0" max="100">%
+          <button onclick="setV('t3')">✓</button></span>
   </div>
 </div>
 
@@ -488,6 +589,13 @@ function refresh(){
     document.getElementById('veco2').textContent=d.eco2+' ppm';
     document.getElementById('vhum').textContent=d.humidity.toFixed(1)+'%';
     document.getElementById('vtemp').textContent=d.temp.toFixed(1)+'°C';
+    // Suelo
+    var sp=Math.min(100,Math.max(0,d.soil));
+    document.getElementById('vsoil').textContent=sp.toFixed(0)+'%';
+    var bar=document.getElementById('soil-bar');
+    bar.style.width=sp+'%';
+    bar.style.background=sp>70?'#1565c0':sp>40?'#43a047':'#ef6c00';
+    // Extractor
     var ext=document.getElementById('ext-s');
     ext.textContent=d.relay?'ON':'OFF'; ext.className=d.relay?'on':'off';
     var mb=document.getElementById('mode-b');
@@ -500,6 +608,7 @@ function refresh(){
     else ti.textContent='';
     document.getElementById('t1').value=d.t1;
     document.getElementById('t2').value=d.t2;
+    document.getElementById('t3').value=d.t3;
     document.getElementById('ton').value=d.ton;
     document.getElementById('tof').value=d.tof;
   }).catch(()=>{});
@@ -512,66 +621,95 @@ refresh(); setInterval(refresh,8000);
 
 void handleRoot() { webServer.send_P(200, "text/html", HTML); }
 
-void handleApi() {
+void handleApi()
+{
     JsonDocument doc;
-    doc["aqi"]        = gAQI;
-    doc["tvoc"]       = gTVOC;
-    doc["eco2"]       = gECO2;
-    doc["humidity"]   = (float)round(gHumidity * 10) / 10.0f;
-    doc["temp"]       = (float)round(gTemp     * 10) / 10.0f;
-    doc["relay"]      = gExtractor;
-    doc["auto"]       = gAutoMode;
-    doc["cooldown"]   = gInCooldown;
-    doc["t1"]         = gThresh1;
-    doc["t2"]         = gThresh2;
-    doc["ton"]        = gTimerOnMin;
-    doc["tof"]        = gTimerOffMin;
-    String out; serializeJson(doc, out);
+    doc["aqi"] = gAQI;
+    doc["tvoc"] = gTVOC;
+    doc["eco2"] = gECO2;
+    doc["humidity"] = (float)round(gHumidity * 10) / 10.0f;
+    doc["temp"] = (float)round(gTemp * 10) / 10.0f;
+    doc["soil"] = (float)round(gSoilHum * 10) / 10.0f;
+    doc["relay"] = gExtractor;
+    doc["auto"] = gAutoMode;
+    doc["cooldown"] = gInCooldown;
+    doc["t1"] = gThresh1;
+    doc["t2"] = gThresh2;
+    doc["t3"] = gThresh3;
+    doc["ton"] = gTimerOnMin;
+    doc["tof"] = gTimerOffMin;
+    String out;
+    serializeJson(doc, out);
     webServer.send(200, "application/json", out);
 }
 
-void handleSet() {
+void handleSet()
+{
     bool changed = false;
-    if (webServer.hasArg("relay")) {
-        gAutoMode = false; gInCooldown = false;
-        setExtractor(webServer.arg("relay") == "ON"); changed = true;
-    }
-    if (webServer.hasArg("mode")) {
-        gAutoMode = (webServer.arg("mode") == "AUTO");
-        if (gAutoMode) evaluateAuto(); changed = true;
-    }
-    if (webServer.hasArg("t1")) {
-        gThresh1 = constrain(webServer.arg("t1").toFloat(), 1.0f, 5.0f);
-        evaluateAuto(); changed = true;
-    }
-    if (webServer.hasArg("t2")) {
-        gThresh2 = constrain(webServer.arg("t2").toFloat(), 0.0f, 100.0f);
-        evaluateAuto(); changed = true;
-    }
-    if (webServer.hasArg("ton")) {
-        gTimerOnMin  = (uint16_t)constrain(webServer.arg("ton").toInt(), 0, 1440);
+    if (webServer.hasArg("relay"))
+    {
+        gAutoMode = false;
+        gInCooldown = false;
+        setExtractor(webServer.arg("relay") == "ON");
         changed = true;
     }
-    if (webServer.hasArg("tof")) {
+    if (webServer.hasArg("mode"))
+    {
+        gAutoMode = (webServer.arg("mode") == "AUTO");
+        if (gAutoMode)
+            evaluateAuto();
+        changed = true;
+    }
+    if (webServer.hasArg("t1"))
+    {
+        gThresh1 = constrain(webServer.arg("t1").toFloat(), 1.0f, 5.0f);
+        evaluateAuto();
+        changed = true;
+    }
+    if (webServer.hasArg("t2"))
+    {
+        gThresh2 = constrain(webServer.arg("t2").toFloat(), 0.0f, 100.0f);
+        evaluateAuto();
+        changed = true;
+    }
+    if (webServer.hasArg("t3"))
+    {
+        gThresh3 = constrain(webServer.arg("t3").toFloat(), 0.0f, 100.0f);
+        evaluateAuto();
+        changed = true;
+    }
+    if (webServer.hasArg("ton"))
+    {
+        gTimerOnMin = (uint16_t)constrain(webServer.arg("ton").toInt(), 0, 1440);
+        changed = true;
+    }
+    if (webServer.hasArg("tof"))
+    {
         gTimerOffMin = (uint16_t)constrain(webServer.arg("tof").toInt(), 0, 1440);
         changed = true;
     }
-    if (changed) { saveConfig(); publishAll(); }
+    if (changed)
+    {
+        saveConfig();
+        publishAll();
+    }
     webServer.send(200, "text/plain", "OK");
 }
 
 /* ══════════════════════════════════════════════════════════
    OTA
    ══════════════════════════════════════════════════════════ */
-void setupOTA() {
+void setupOTA()
+{
     ArduinoOTA.setHostname("extractor-esp");
-    ArduinoOTA.onStart([]()  { Serial.println("OTA: inicio"); });
-    ArduinoOTA.onEnd([]()    { Serial.println("\nOTA: fin");  });
-    ArduinoOTA.onError([](ota_error_t e) {
-        Serial.printf("OTA error [%u]\n", e);
-    });
+    ArduinoOTA.onStart([]()
+                       { Serial.println(F("OTA: inicio")); });
+    ArduinoOTA.onEnd([]()
+                     { Serial.println(F("\nOTA: fin")); });
+    ArduinoOTA.onError([](ota_error_t e)
+                       { Serial.printf_P(PSTR("OTA error [%u]\n"), e); });
     ArduinoOTA.begin();
-    Serial.println("OTA listo → 'extractor-esp'.");
+    Serial.println(F("OTA listo → 'extractor-esp'."));
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -579,110 +717,123 @@ void setupOTA() {
    ══════════════════════════════════════════════════════════ */
 void saveConfigCallback() { needSave = true; }
 
-void setup() {
+void setup()
+{
     Serial.begin(115200);
-    Serial.println("\n=== Extractor ESP8266 ===");
+    Serial.println(F("\n=== Extractor ESP8266 ==="));
 
     /* ── Relay: forzar OFF físicamente antes de cualquier otra init.
-     * Se escribe directamente (sin pasar por setExtractor) para
-     * garantizar el estado del pin independientemente del valor
-     * inicial de gExtractor.                                        */
+     * Con RELAY_OFF = HIGH (bobina en reposo) → contacto NO abierto
+     * → extractor desconectado. Fail-safe real.                      */
     pinMode(PIN_RELAY, OUTPUT);
     digitalWrite(PIN_RELAY, RELAY_OFF);
     gExtractor = false;
 
+    /* ── A0 no necesita pinMode() en ESP8266 (solo entrada ADC)      */
+
     /* ── I2C ──────────────────────────────────────────────────────
-     * Wire.begin() sin argumentos: SDA=D2(GPIO4), SCL=D1(GPIO5)
-     * Estos son los pines estándar I2C del NodeMCU v2.             */
+     * Wire.begin() sin argumentos: SDA=D2(GPIO4), SCL=D1(GPIO5)   */
     Wire.begin();
 
     /* ── ENS160 ───────────────────────────────────────────────── */
     ens160.begin(&Wire, ENS160_I2C_ADDRESS);
 
-    Serial.println("begin ens160..");
+    Serial.println(F("begin ens160.."));
     int retries = 0;
     while (ens160.init() != true && retries < 500)
     {
-        Serial.print(".");
+        Serial.print(F("."));
         delay(1000);
         retries++;
     }
     if (retries >= 500)
     {
-        Serial.println("Error: ENS160 no responde. Iniciando sin sensor.");
-     
+        Serial.println(F("Error: ENS160 no responde. Iniciando sin sensor."));
     }
     else
     {
-        Serial.println("success");
+        Serial.println(F("success"));
     }
 
     /* ── AHT21 ────────────────────────────────────────────────── */
-    if (!aht.begin()) {
-        Serial.println("[AHT21] no encontrado – verifica cableado I2C.");
-    } else {
-        Serial.println("[AHT21] OK.");
+    if (!aht.begin())
+    {
+        Serial.println(F("[AHT21] no encontrado – verifica cableado I2C."));
+    }
+    else
+    {
+        Serial.println(F("[AHT21] OK."));
     }
 
     loadConfig();
 
-    /* ── WiFiManager ──────────────────────────────────────────────
-     * WiFi.persistent(false): impide que el SDK de ESP8266 escriba
-     * credenciales en su propio sector flash en cada reconexión.
-     * WiFiManager gestiona sus credenciales en LittleFS de forma
-     * independiente y no se ve afectado por esta opción.
-     * Debe llamarse ANTES de autoConnect().                        */
+    /* ── WiFiManager ─────────────────────────────────────────────*/
     WiFi.persistent(false);
+
+    /* D3 pulsado en boot → forzar portal de configuración        */
+    pinMode(PIN_CFG_FORCE, INPUT_PULLUP);
+    bool forcePortal = (digitalRead(PIN_CFG_FORCE) == LOW);
+    if (forcePortal)
+        Serial.println(F("PIN_CFG_FORCE activo → forzando portal WiFi."));
 
     WiFiManagerParameter pHost("h", "MQTT Host", cfgHost, 63);
     WiFiManagerParameter pPort("p", "MQTT Port", cfgPort, 5);
     WiFiManagerParameter pUser("u", "MQTT User", cfgUser, 31);
     WiFiManagerParameter pPass("w", "MQTT Pass", cfgPass, 31);
 
-    WiFiManager wm;
-    wm.addParameter(&pHost);
-    wm.addParameter(&pPort);
-    wm.addParameter(&pUser);
-    wm.addParameter(&pPass);
-    wm.setSaveConfigCallback(saveConfigCallback);
-    wm.setConfigPortalTimeout(180);
+    { // bloque para destruir wm en cuanto ya no hace falta
+        WiFiManager wm;
+        wm.addParameter(&pHost);
+        wm.addParameter(&pPort);
+        wm.addParameter(&pUser);
+        wm.addParameter(&pPass);
+        wm.setSaveConfigCallback(saveConfigCallback);
+        wm.setConfigPortalTimeout(180);
 
-    if (!wm.autoConnect("ExtractorAP")) {
-        Serial.println("Sin WiFi – reiniciando en 5s…");
-        delay(5000);
-        ESP.restart();
-    }
-    Serial.println("WiFi OK: " + WiFi.localIP().toString());
+        bool connected;
+        if (forcePortal)
+        {
+            connected = wm.startConfigPortal("ExtractorAP");
+        }
+        else
+        {
+            connected = wm.autoConnect("ExtractorAP");
+        }
 
-    /* ── WIFI_MODEM_SLEEP ─────────────────────────────────────────
-     * El radio se apaga entre intervalos de beacon del AP (~100 ms),
-     * reduciendo el consumo mientras mantiene la asociación intacta.
-     * El ESP se despierta automáticamente en TX o al recibir datos.
-     *
-     * IMPORTANTE: se fija DESPUÉS de autoConnect(). Configurarlo
-     * antes puede interferir con el portal captivo de WiFiManager.
-     *
-     * setAutoReconnect(true): el SDK reconecta automáticamente si
-     * el AP desaparece y vuelve, sin intervención del firmware.    */
+        if (!connected)
+        {
+            Serial.println(F("Sin WiFi – reiniciando en 5s…"));
+            delay(5000);
+            ESP.restart();
+        }
+
+        if (needSave)
+        {
+            strlcpy(cfgHost, pHost.getValue(), sizeof(cfgHost));
+            strlcpy(cfgPort, pPort.getValue(), sizeof(cfgPort));
+            strlcpy(cfgUser, pUser.getValue(), sizeof(cfgUser));
+            strlcpy(cfgPass, pPass.getValue(), sizeof(cfgPass));
+            saveConfig();
+        }
+    } // wm se destruye aquí → libera ~10 KB de heap
+
+    Serial.print(F("WiFi OK: "));
+    Serial.println(WiFi.localIP());
+
     WiFi.setSleepMode(WIFI_MODEM_SLEEP);
     WiFi.setAutoReconnect(true);
 
-    if (needSave) {
-        strlcpy(cfgHost, pHost.getValue(), sizeof(cfgHost));
-        strlcpy(cfgPort, pPort.getValue(), sizeof(cfgPort));
-        strlcpy(cfgUser, pUser.getValue(), sizeof(cfgUser));
-        strlcpy(cfgPass, pPass.getValue(), sizeof(cfgPass));
-        saveConfig();
-    }
+    Serial.printf_P(PSTR("Heap libre tras WiFi: %u bytes\n"), ESP.getFreeHeap());
 
-    Serial.printf("Heap libre tras WiFi: %u bytes\n", ESP.getFreeHeap());
+    /* ── MQTT sobre TLS (puerto 8883) – sin verificar certificado */
+    wifiClient.setInsecure();
 
     mqtt.setServer(cfgHost, atoi(cfgPort));
     mqtt.setCallback(mqttCallback);
     mqtt.setKeepAlive(60);
     mqtt.setBufferSize(512);
 
-    webServer.on("/",    handleRoot);
+    webServer.on("/", handleRoot);
     webServer.on("/api", handleApi);
     webServer.on("/set", handleSet);
     webServer.begin();
@@ -696,22 +847,24 @@ void setup() {
 /* ══════════════════════════════════════════════════════════
    Loop
    ══════════════════════════════════════════════════════════ */
-void loop() {
-    /* ── WiFi watchdog ────────────────────────────────────────────
-     * setAutoReconnect gestiona la reconexión habitual, pero en
-     * algunos casos el SDK de ESP8266 puede quedarse en un estado
-     * corrupto indefinidamente. Un reinicio limpio garantiza la
-     * recuperación. Umbral: 2 minutos sin WiFi → ESP.restart().   */
-    if (WiFi.status() != WL_CONNECTED) {
-        if (!wifiWasLost) {
+void loop()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        if (!wifiWasLost)
+        {
             wifiWasLost = true;
-            tWifiLost   = millis();
-            Serial.println("WiFi desconectado.");
-        } else if (millis() - tWifiLost > INTERVAL_WIFI_WDT) {
-            Serial.println("WiFi perdido > 2 min → reiniciando.");
+            tWifiLost = millis();
+            Serial.println(F("WiFi desconectado."));
+        }
+        else if (millis() - tWifiLost > INTERVAL_WIFI_WDT)
+        {
+            Serial.println(F("WiFi perdido > 2 min → reiniciando."));
             ESP.restart();
         }
-    } else {
+    }
+    else
+    {
         wifiWasLost = false;
     }
 
@@ -722,15 +875,15 @@ void loop() {
 
     unsigned long now = millis();
 
-    if (now - tSensor >= INTERVAL_SENSOR) {
+    if (now - tSensor >= INTERVAL_SENSOR)
+    {
         tSensor = now;
         readSensors();
         evaluateAuto();
     }
-    if (now - tMqtt >= INTERVAL_MQTT) {
+    if (now - tMqtt >= INTERVAL_MQTT)
+    {
         tMqtt = now;
-        Serial.printf("[heap] libre: %u B  frag: %u%%\n",
-                      ESP.getFreeHeap(), ESP.getHeapFragmentation());
         publishAll();
     }
 }
