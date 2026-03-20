@@ -329,7 +329,7 @@ void readSensors()
      *  Mapeamos inversamente: 100 % = muy húmedo, 0 % = seco.         */
 
     analogWrite(PIN_SOIL_VCC, 128); // PWM 50% duty cycle
-    delay(200);           // dejar estabilizar el filtro RC
+    delay(350);           // dejar estabilizar el filtro RC
     int raw = analogRead(PIN_SOIL);
     digitalWrite(PIN_SOIL_VCC, LOW); // apagar inmediatamente
 
