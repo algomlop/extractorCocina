@@ -39,6 +39,69 @@
 #include <ArduinoOTA.h>
 #include <ESP8266mDNS.h>
 #include "include/secrets.h"
+#include <TelnetStream.h>
+
+
+void logToFile(const char* msg);
+
+#define LOG_PRINT(x)                                                           \
+    {                                                                          \
+        Serial.print(x);                                                       \
+        if (telnetReady)                                                       \
+            TelnetStream.print(x);                                             \
+        /* LOG_PRINT no escribe a fichero — sin newline, se acumularía roto */ \
+    }
+
+#define LOG_PRINTLN(x)                    \
+    {                                     \
+        Serial.println(x);                \
+        if (telnetReady)                  \
+            TelnetStream.println(x);      \
+        {                                 \
+            String _s = String(x) + "\n"; \
+            logToFile(_s.c_str());        \
+        }                                 \
+    }
+
+#define LOG_PRINTLN0()              \
+    {                               \
+        Serial.println();           \
+        if (telnetReady)            \
+            TelnetStream.println(); \
+        logToFile("\n");            \
+    }
+
+#define LOG_PRINTF(fmt, ...)                                  \
+    {                                                         \
+        Serial.printf(fmt, ##__VA_ARGS__);                    \
+        if (telnetReady)                                      \
+        {                                                     \
+            char _buf[256];                                   \
+            snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
+            TelnetStream.print(_buf);                         \
+            logToFile(_buf);                                  \
+        }                                                     \
+        else                                                  \
+        {                                                     \
+            char _buf[256];                                   \
+            snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
+            logToFile(_buf);                                  \
+        }                                                     \
+    }
+
+#define LOG_PRINTF_P(fmt, ...)                                  \
+    {                                                           \
+        Serial.printf_P(fmt, ##__VA_ARGS__);                    \
+        {                                                       \
+            char _buf[256];                                     \
+            snprintf_P(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
+            if (telnetReady)                                    \
+                TelnetStream.print(_buf);                       \
+            logToFile(_buf);                                    \
+        }                                                       \
+    }
+#define MAX_LOG_BYTES 16384UL // 16 KB — ajusta según tu LittleFS
+
 
 /* ─── Pins ────────────────────────────────────────────────────
  * I2C usa D1(SCL/GPIO5) y D2(SDA/GPIO4) — pines Wire por defecto.
@@ -48,8 +111,8 @@
 #define PIN_SOIL A0      // ADC – sensor humedad suelo (capacitivo)
 #define PIN_CFG_FORCE D3 // GPIO0 – mantener pulsado en boot para forzar portal WiFiManager
 
-/* ─── Relay NO  ─────────────────────────
-#define RELAY_ON HIGH   // bobina activada  → NO cerrado → extractor ON
+/* ─── Relay NO  ─────────────────────────*/
+#define RELAY_ON HIGH // bobina activada  → NO cerrado → extractor ON
 #define RELAY_OFF LOW // bobina en reposo → NO abierto → extractor OFF
 
 /* ─── Calibración sensor suelo ────────────────────────────────
@@ -109,6 +172,8 @@ BearSSL::WiFiClientSecure wifiClient;
 PubSubClient mqtt(wifiClient);
 ESP8266WebServer webServer(80);
 
+bool telnetReady = false;
+
 /* ─── Estado sensores ─────────────────────────────────────────*/
 uint8_t gAQI = 1;
 uint16_t gTVOC = 0;
@@ -118,8 +183,8 @@ float gHumidity = 0.0f; // % humedad relativa aire (AHT21)
 float gTemp = 0.0f;     // °C (AHT21)
 float gSoilHum = 0.0f;  // % humedad suelo (A0)
 
-bool gAHTok = false; 
-bool gENSok = false; 
+bool gAHTok = false;
+bool gENSok = false;
 
 /* ─── Control extractor ───────────────────────────────────────*/
 bool gExtractor = false;
@@ -141,7 +206,6 @@ char cfgPort[6] = SECRET_MQTT_PORT;
 char cfgUser[32] = SECRET_MQTT_USER;
 char cfgPass[32] = SECRET_MQTT_PASS;
 
-
 /* ─── Timers globales ─────────────────────────────────────────*/
 unsigned long tSensor = 0;
 unsigned long tMqtt = 0;
@@ -156,11 +220,11 @@ void loadConfig()
 {
     if (!LittleFS.begin())
     {
-        Serial.println(F("LittleFS error"));
+        LOG_PRINTLN(F("LittleFS error"));
         return;
     }
-    //borrado /cfg.json
-    //LittleFS.remove("/cfg.json");
+    // borrado /cfg.json
+    // LittleFS.remove("/cfg.json");
 
     File f = LittleFS.open("/cfg.json", "r");
     if (!f)
@@ -176,7 +240,7 @@ void loadConfig()
         gTimerOffMin = doc["tof"] | 0;
     }
     f.close();
-    Serial.printf_P(PSTR("Config OK. MQTT: %s:%s\n"), cfgHost, cfgPort);
+    LOG_PRINTF_P(PSTR("Config OK. MQTT: %s:%s\n"), cfgHost, cfgPort);
 }
 
 void saveConfig()
@@ -194,7 +258,47 @@ void saveConfig()
     doc["tof"] = gTimerOffMin;
     serializeJson(doc, f);
     f.close();
-    Serial.println(F("Config guardado."));
+    LOG_PRINTLN(F("Config guardado."));
+}
+
+
+void logToFile(const char *msg)
+{
+    File f = LittleFS.open("/log.txt", "a");
+    if (!f)
+        return;
+
+    // Rotación si supera el límite
+    if (f.size() >= MAX_LOG_BYTES)
+    {
+        f.close();
+
+        // Copiar la 2ª mitad a /log.tmp en chunks (RAM mínima)
+        File src = LittleFS.open("/log.txt", "r");
+        File dst = LittleFS.open("/log.tmp", "w");
+        if (src && dst)
+        {
+            src.seek(MAX_LOG_BYTES / 2);
+            uint8_t chunk[256];
+            while (src.available())
+            {
+                size_t n = src.read(chunk, sizeof(chunk));
+                dst.write(chunk, n);
+            }
+        }
+        src.close();
+        dst.close();
+
+        LittleFS.remove("/log.txt");
+        LittleFS.rename("/log.tmp", "/log.txt");
+
+        f = LittleFS.open("/log.txt", "a");
+        if (!f)
+            return;
+    }
+
+    f.print(msg);
+    f.close();
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -211,7 +315,7 @@ void setExtractor(bool on)
         tExtractorOn = millis();
         gInCooldown = false;
     }
-    Serial.printf_P(PSTR("Extractor: %s\n"), on ? "ON" : "OFF");
+    LOG_PRINTF_P(PSTR("Extractor: %s\n"), on ? "ON" : "OFF");
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -228,13 +332,13 @@ void evaluateAuto()
     {
         if (now - tExtractorOn >= (unsigned long)gTimerOnMin * 60000UL)
         {
-            Serial.println(F("Timer ON expirado → apagando."));
+            LOG_PRINTLN(F("Timer ON expirado → apagando."));
             setExtractor(false);
             if (gTimerOffMin > 0)
             {
                 gInCooldown = true;
                 tCooldownStart = now;
-                Serial.printf_P(PSTR("Cooldown: %u min.\n"), gTimerOffMin);
+                LOG_PRINTF_P(PSTR("Cooldown: %u min.\n"), gTimerOffMin);
             }
             return;
         }
@@ -246,7 +350,7 @@ void evaluateAuto()
         if (now - tCooldownStart < (unsigned long)gTimerOffMin * 60000UL)
             return;
         gInCooldown = false;
-        Serial.println(F("Cooldown terminado."));
+        LOG_PRINTLN(F("Cooldown terminado."));
     }
 
     /* ── Disparadores ──────────────────────────────────────────
@@ -282,7 +386,8 @@ void evaluateAuto()
 void readSensors()
 {
     /* 1. AHT21 primero – sus datos se usan para compensar el ENS160 */
-    if (gAHTok) {
+    if (gAHTok)
+    {
 
         sensors_event_t evtHum, evtTemp;
         if (aht.getEvent(&evtHum, &evtTemp))
@@ -295,13 +400,14 @@ void readSensors()
         }
         else
         {
-            Serial.println(F("[AHT21] error de lectura."));
+            LOG_PRINTLN(F("[AHT21] error de lectura."));
         }
     }
 
     /* 2. ENS160 */
-    if (gENSok) {
-        //ens160.wait();
+    if (gENSok)
+    {
+        // ens160.wait();
         if (ens160.update() == RESULT_OK)
         {
             if (ens160.hasNewData())
@@ -314,7 +420,7 @@ void readSensors()
         }
         else
         {
-            Serial.println(F("[ENS160] error de lectura."));
+            LOG_PRINTLN(F("[ENS160] error de lectura."));
             gENSValid = false;
         }
     }
@@ -325,14 +431,14 @@ void readSensors()
      *  Mapeamos inversamente: 100 % = muy húmedo, 0 % = seco.         */
 
     analogWrite(PIN_SOIL_VCC, 128); // PWM 50% duty cycle
-    delay(200);           // dejar estabilizar el filtro RC
+    delay(200);                     // dejar estabilizar el filtro RC
     int raw = analogRead(PIN_SOIL);
     digitalWrite(PIN_SOIL_VCC, LOW); // apagar inmediatamente
 
     int clampedRaw = constrain(raw, SOIL_WET, SOIL_DRY);
     gSoilHum = 100.0f * (SOIL_DRY - clampedRaw) / (float)(SOIL_DRY - SOIL_WET);
 
-    Serial.printf_P(
+    LOG_PRINTF_P(
         PSTR("ENS160 AQI:%u  TVOC:%u ppb  eCO2:%u ppm | "
              "AHT21  HR:%.1f%%  T:%.1f°C | "
              "Suelo  raw:%d  %.1f%%\n"),
@@ -346,7 +452,7 @@ void publishAll()
 {
     if (!mqtt.connected())
         return;
-   
+
     char buf[12];
 
     auto pubF = [&](const char *t, float v, uint8_t dec = 1)
@@ -391,7 +497,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int len)
 {
     char msg[64] = {0};
     memcpy(msg, payload, min(len, (unsigned int)63));
-    Serial.printf_P(PSTR("MQTT ← [%s]: %s\n"), topic, msg);
+    LOG_PRINTF_P(PSTR("MQTT ← [%s]: %s\n"), topic, msg);
 
     if (strcmp(topic, T_SET_RELAY) == 0)
     {
@@ -441,7 +547,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int len)
    ══════════════════════════════════════════════════════════ */
 bool mqttReconnect()
 {
-   
+
     if (mqtt.connected())
         return true;
     unsigned long now = millis();
@@ -451,7 +557,7 @@ bool mqttReconnect()
     if (cfgHost[0] == '\0')
         return false;
 
-    Serial.printf_P(PSTR("MQTT → %s:%s  (heap: %u B)…\n"), cfgHost, cfgPort, ESP.getFreeHeap());
+    LOG_PRINTF_P(PSTR("MQTT → %s:%s  (heap: %u B)…\n"), cfgHost, cfgPort, ESP.getFreeHeap());
     String cid = "esp-ext-" + String(ESP.getChipId(), HEX);
 
     bool ok = mqtt.connect(
@@ -463,7 +569,7 @@ bool mqttReconnect()
 
     if (ok)
     {
-        Serial.println(F("MQTT OK."));
+        LOG_PRINTLN(F("MQTT OK."));
         mqtt.publish(T_STATUS, "online", true);
 
         mqtt.subscribe(T_SET_RELAY);
@@ -477,7 +583,7 @@ bool mqttReconnect()
     }
     else
     {
-        Serial.printf_P(PSTR("MQTT error %d\n"), mqtt.state());
+        LOG_PRINTF_P(PSTR("MQTT error %d\n"), mqtt.state());
     }
     return ok;
 }
@@ -586,6 +692,15 @@ const char HTML[] PROGMEM = R"html(
     </div>
   </div>
 </div>
+<div class="card">
+  <h3>Logs</h3>
+  <p class="note"><a href="/log" target="_blank" style="font-size:.85em;color:#1565c0">📋 Ver log</a></p>
+  
+</div>
+
+
+
+
 
 <script>
 var AQI_LBL=['','Buena','Moderada','Sensible','Mala','Pésima'];
@@ -711,30 +826,70 @@ void handleSet()
 void setupOTA()
 {
     if (!MDNS.begin("extractor-esp"))
-    { 
-        Serial.println("Error configurando mDNS");
+    {
+        LOG_PRINTLN("Error configurando mDNS");
     }
     else
     {
-        Serial.println("mDNS configurado: extractor-esp");
+        LOG_PRINTLN("mDNS configurado: extractor-esp");
     }
-
-
 
     ArduinoOTA.setHostname("extractor-esp");
     ArduinoOTA.onStart([]()
                        {
     WiFi.setSleepMode(WIFI_NONE_SLEEP); // radio siempre activa durante OTA
-    Serial.println(F("OTA: inicio")); });
+    LOG_PRINTLN(F("OTA: inicio")); });
     ArduinoOTA.onEnd([]()
                      {
     WiFi.setSleepMode(WIFI_MODEM_SLEEP); // vuelve a dormir al terminar
-    Serial.println(F("\nOTA: fin")); });
+    LOG_PRINTLN(F("\nOTA: fin")); });
     ArduinoOTA.onError([](ota_error_t e)
-                       { Serial.printf_P(PSTR("OTA error [%u]\n"), e); });
+                       { LOG_PRINTF_P(PSTR("OTA error [%u]\n"), e); });
     ArduinoOTA.begin();
-    Serial.println(F("OTA listo → 'extractor-esp'."));
+    LOG_PRINTLN(F("OTA listo → 'extractor-esp'."));
 }
+
+
+void handleLog() {
+    File f = LittleFS.open("/log.txt", "r");
+    if (!f) {
+        webServer.send(200, "text/html",
+            "<pre>Log vacío.</pre>");
+        return;
+    }
+    // Cabecera HTML con auto-scroll y refresco
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.send(200, "text/html", "");
+    webServer.sendContent(
+        "<!DOCTYPE html><html><head>"
+        "<meta charset=UTF-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Log – Extractor</title>"
+        "<style>body{background:#111;color:#cfc;font-family:monospace;font-size:.82em;"
+        "padding:10px}pre{white-space:pre-wrap;word-break:break-all}"
+        "a{color:#7bf;text-decoration:none;margin-right:12px}</style></head><body>"
+        "<p><a href='/'>← Inicio</a>"
+        "<a href='/log'>↺ Refrescar</a>"
+        "<a href='/log/clear'>🗑 Borrar</a></p><pre>"
+    );
+    // Stream del fichero en chunks — 0 heap extra
+    uint8_t chunk[256];
+    while (f.available()) {
+        size_t n = f.read(chunk, sizeof(chunk));
+        webServer.sendContent(reinterpret_cast<char*>(chunk), n);
+    }
+    f.close();
+    webServer.sendContent("</pre><script>window.scrollTo(0,document.body.scrollHeight)</script>"
+                          "</body></html>");
+    webServer.sendContent("");
+}
+
+void handleLogClear() {
+    LittleFS.remove("/log.txt");
+    webServer.sendHeader("Location", "/log");
+    webServer.send(303);
+}
+
 
 /* ══════════════════════════════════════════════════════════
    Setup
@@ -743,11 +898,11 @@ void setupOTA()
 void setup()
 {
     Serial.begin(115200);
-    Serial.println(F("\n=== Extractor ESP8266 ==="));
+    LOG_PRINTLN(F("\n=== Extractor ESP8266 ==="));
 
     pinMode(PIN_SOIL_VCC, OUTPUT);
     digitalWrite(PIN_SOIL_VCC, LOW);
-    analogWriteFreq(500); 
+    analogWriteFreq(500);
 
     /* ── Relay: forzar OFF físicamente antes de cualquier otra init.
      * Con RELAY_OFF = HIGH (bobina en reposo) → contacto NO abierto
@@ -763,8 +918,6 @@ void setup()
      * Wire.begin() sin argumentos: SDA=D2(GPIO4), SCL=D1(GPIO5)   */
     Wire.begin();
 
-
-    
     loadConfig();
 
     /* ── WiFiManager ─────────────────────────────────────────────*/
@@ -774,39 +927,39 @@ void setup()
     pinMode(PIN_CFG_FORCE, INPUT_PULLUP);
     bool forcePortal = (digitalRead(PIN_CFG_FORCE) == LOW);
     if (forcePortal)
-        Serial.println(F("PIN_CFG_FORCE activo → forzando portal WiFi."));
+        LOG_PRINTLN(F("PIN_CFG_FORCE activo → forzando portal WiFi."));
 
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(180);
+    wm.setHostname("extractor-esp");
 
-        WiFiManager wm;        
-        wm.setConfigPortalTimeout(180);
-        wm.setHostname("extractor-esp");
+    bool connected;
+    if (forcePortal)
+    {
+        connected = wm.startConfigPortal("ExtractorAP");
+    }
+    else
+    {
+        connected = wm.autoConnect("ExtractorAP");
+    }
 
-        bool connected;
-        if (forcePortal)
-        {
-            connected = wm.startConfigPortal("ExtractorAP");
-        }
-        else
-        {
-            connected = wm.autoConnect("ExtractorAP");
-        }
+    if (!connected)
+    {
+        LOG_PRINTLN(F("Sin WiFi – reiniciando en 5s…"));
+        delay(5000);
+        ESP.restart();
+    }
 
-        if (!connected)
-        {
-            Serial.println(F("Sin WiFi – reiniciando en 5s…"));
-            delay(5000);
-            ESP.restart();
-        }
-
-
-
-    Serial.print(F("WiFi OK: "));
-    Serial.println(WiFi.localIP());
+    LOG_PRINT(F("WiFi OK: "));
+    LOG_PRINTLN(WiFi.localIP().toString().c_str());
 
     WiFi.setSleepMode(WIFI_MODEM_SLEEP);
     WiFi.setAutoReconnect(true);
 
-    Serial.printf_P(PSTR("Heap libre tras WiFi: %u bytes\n"), ESP.getFreeHeap());
+    TelnetStream.begin();
+    telnetReady = true;
+
+    LOG_PRINTF_P(PSTR("Heap libre tras WiFi: %u bytes\n"), ESP.getFreeHeap());
 
     /* ── MQTT sobre TLS (puerto 8883) – sin verificar certificado */
     wifiClient.setInsecure();
@@ -819,43 +972,42 @@ void setup()
     webServer.on("/", handleRoot);
     webServer.on("/api", handleApi);
     webServer.on("/set", handleSet);
+    webServer.on("/log", handleLog);
+    webServer.on("/log/clear", handleLogClear);
     webServer.begin();
 
-    
     setupOTA();
-
-
 
     /* ── ENS160 ───────────────────────────────────────────────── */
     ens160.begin(&Wire, ENS160_I2C_ADDRESS);
 
-    Serial.println(F("begin ens160.."));
+    LOG_PRINTLN(F("begin ens160.."));
     int retries = 0;
     while (ens160.init() != true && retries < 20)
     {
-        Serial.print(F("."));
+        LOG_PRINT(F("."));
         delay(1000);
         retries++;
     }
     gENSok = (retries < 20);
     if (!gENSok)
     {
-        Serial.println(F("Error: ENS160 no responde. Iniciando sin sensor."));
+        LOG_PRINTLN(F("Error: ENS160 no responde. Iniciando sin sensor."));
     }
     else
     {
-        Serial.println(F("success"));
+        LOG_PRINTLN(F("success"));
     }
 
     /* ── AHT21 ────────────────────────────────────────────────── */
     gAHTok = aht.begin();
     if (!gAHTok)
     {
-        Serial.println(F("[AHT21] no encontrado – verifica cableado I2C."));
+        LOG_PRINTLN(F("[AHT21] no encontrado – verifica cableado I2C."));
     }
     else
     {
-        Serial.println(F("[AHT21] OK."));
+        LOG_PRINTLN(F("[AHT21] OK."));
     }
 
     tSensor = millis() - INTERVAL_SENSOR;
@@ -872,11 +1024,11 @@ void loop()
         {
             wifiWasLost = true;
             tWifiLost = millis();
-            Serial.println(F("WiFi desconectado."));
+            LOG_PRINTLN(F("WiFi desconectado."));
         }
         else if (millis() - tWifiLost > INTERVAL_WIFI_WDT)
         {
-            Serial.println(F("WiFi perdido > 2 min → reiniciando."));
+            LOG_PRINTLN(F("WiFi perdido > 2 min → reiniciando."));
             ESP.restart();
         }
     }
