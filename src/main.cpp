@@ -48,20 +48,16 @@
 #define PIN_SOIL A0      // ADC – sensor humedad suelo (capacitivo)
 #define PIN_CFG_FORCE D3 // GPIO0 – mantener pulsado en boot para forzar portal WiFiManager
 
-/* ─── Relay NO active-low (fail-safe) ─────────────────────────
- *  Usando el contacto NO del módulo relé con lógica active-low.
- *  En reposo (HIGH / sin energía) la bobina está desactivada,
- *  el contacto NO permanece ABIERTO → extractor OFF.
- *  Ventaja: un fallo del ESP o un reset nunca enciende el motor. */
-#define RELAY_ON LOW   // bobina activada  → NO cerrado → extractor ON
-#define RELAY_OFF HIGH // bobina en reposo → NO abierto → extractor OFF
+/* ─── Relay NO  ─────────────────────────
+#define RELAY_ON HIGH   // bobina activada  → NO cerrado → extractor ON
+#define RELAY_OFF LOW // bobina en reposo → NO abierto → extractor OFF
 
 /* ─── Calibración sensor suelo ────────────────────────────────
  *  Ajusta estos valores midiendo con tu sensor:
  *    analogRead() con el sensor en aire seco  → SOIL_DRY
  *    analogRead() con el sensor sumergido     → SOIL_WET */
-#define SOIL_DRY 820 // ADC raw ~ suelo completamente seco
-#define SOIL_WET 380 // ADC raw ~ suelo completamente húmedo
+#define SOIL_DRY 964 // ADC raw ~ suelo completamente seco
+#define SOIL_WET 339 // ADC raw ~ suelo completamente húmedo
 
 /* ─── Histéresis ──────────────────────────────────────────────
  *  Evita chatter en los disparadores de humedad.               */
@@ -305,7 +301,7 @@ void readSensors()
 
     /* 2. ENS160 */
     if (gENSok) {
-        ens160.wait();
+        //ens160.wait();
         if (ens160.update() == RESULT_OK)
         {
             if (ens160.hasNewData())
@@ -329,7 +325,7 @@ void readSensors()
      *  Mapeamos inversamente: 100 % = muy húmedo, 0 % = seco.         */
 
     analogWrite(PIN_SOIL_VCC, 128); // PWM 50% duty cycle
-    delay(350);           // dejar estabilizar el filtro RC
+    delay(200);           // dejar estabilizar el filtro RC
     int raw = analogRead(PIN_SOIL);
     digitalWrite(PIN_SOIL_VCC, LOW); // apagar inmediatamente
 
@@ -751,7 +747,7 @@ void setup()
 
     pinMode(PIN_SOIL_VCC, OUTPUT);
     digitalWrite(PIN_SOIL_VCC, LOW);
-    analogWriteFreq(500000); // 500 kHz en ESP8266
+    analogWriteFreq(500); 
 
     /* ── Relay: forzar OFF físicamente antes de cualquier otra init.
      * Con RELAY_OFF = HIGH (bobina en reposo) → contacto NO abierto
