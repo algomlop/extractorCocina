@@ -173,6 +173,7 @@ PubSubClient mqtt(wifiClient);
 ESP8266WebServer webServer(80);
 
 bool telnetReady = false;
+bool littleFSok=false;
 
 /* ─── Estado sensores ─────────────────────────────────────────*/
 uint8_t gAQI = 1;
@@ -218,9 +219,9 @@ bool wifiWasLost = false;
    ══════════════════════════════════════════════════════════ */
 void loadConfig()
 {
-    if (!LittleFS.begin())
+    if (!littleFSok)
     {
-        LOG_PRINTLN(F("LittleFS error"));
+        LOG_PRINTLN(F("El begin del LittleFS dio error"));
         return;
     }
     // borrado /cfg.json
@@ -245,8 +246,11 @@ void loadConfig()
 
 void saveConfig()
 {
-    if (!LittleFS.begin())
+    if (!littleFSok)
+    {
+        LOG_PRINTF_P(PSTR("El begin del LittleFS no funcionó")); 
         return;
+    }
     File f = LittleFS.open("/cfg.json", "w");
     if (!f)
         return;
@@ -900,6 +904,17 @@ void setup()
     Serial.begin(115200);
     LOG_PRINTLN(F("\n=== Extractor ESP8266 ==="));
 
+    if (!LittleFS.begin())
+    {
+        LOG_PRINTLN(F("ERROR: LittleFS no montado"));
+        littleFSok = false;
+    }
+    else
+    {
+        LOG_PRINTLN(F("LittleFS OK."));
+        littleFSok = true;
+    }
+
     pinMode(PIN_SOIL_VCC, OUTPUT);
     digitalWrite(PIN_SOIL_VCC, LOW);
     analogWriteFreq(500);
@@ -914,9 +929,20 @@ void setup()
 
     /* ── A0 no necesita pinMode() en ESP8266 (solo entrada ADC)      */
 
-    /* ── I2C ──────────────────────────────────────────────────────
-     * Wire.begin() sin argumentos: SDA=D2(GPIO4), SCL=D1(GPIO5)   */
-    Wire.begin();
+    /* ── I2C ────────────────────────────────────────────────────── */
+    Wire.begin(4, 5); // SDA=GPIO4, SCL=GPIO5
+
+    for (byte a = 1; a < 127; a++) {
+        Wire.beginTransmission(a);
+        if (Wire.endTransmission() == 0)
+        {
+            LOG_PRINTF_P(PSTR("Dispositivo en 0x%02X\n"), a);
+        }
+        else
+        {
+            LOG_PRINTF_P(PSTR("Nada encontrado en 0x%02X\n"), a);
+        }
+    }
 
     loadConfig();
 
@@ -983,9 +1009,12 @@ void setup()
 
     LOG_PRINTLN(F("begin ens160.."));
     int retries = 0;
-    while (ens160.init() != true && retries < 20)
+    bool initOk = ens160.init();
+    LOG_PRINTF_P(PSTR("ENS160 init() = %d\n"), initOk);
+
+    while (!initOk && retries < 20)
     {
-        LOG_PRINT(F("."));
+        LOG_PRINTLN(F("."));
         delay(1000);
         retries++;
     }
