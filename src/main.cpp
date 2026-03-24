@@ -6,7 +6,7 @@
  *   D2 → SDA (GPIO4)
  *
  * Módulo ENS160+AHT21 (mismo bus I2C):
- *   ENS160 @ 0x52 → AQI (1–5) / TVOC (ppb) / eCO₂ (ppm)
+ *   ENS160 @ 0x53 → AQI (1–5) / TVOC (ppb) / eCO₂ (ppm)
  *   AHT21  @ 0x38 → Temperatura (°C) / Humedad relativa (%)
  *
  * D5 → Relay IN (GPIO14) – NO active-low  ← usa contacto Normalmente Abierto
@@ -161,7 +161,7 @@ void logToFile(const char* msg);
 
 #define T_STATUS BASE "/status"
 
-#define ENS160_I2C_ADDRESS 0x52
+#define ENS160_I2C_ADDRESS 0x53
 
 #define PIN_SOIL_VCC D6 // GPIO12 — alimentación del sensor
 
@@ -930,8 +930,12 @@ void setup()
     /* ── A0 no necesita pinMode() en ESP8266 (solo entrada ADC)      */
 
     /* ── I2C ────────────────────────────────────────────────────── */
-    Wire.begin(4, 5); // SDA=GPIO4, SCL=GPIO5
+    Wire.begin(D2, D1);    // SDA=D2(GPIO4), SCL=D1(GPIO5)
+    Wire.setClock(100000); // bajar a 100 kHz — el ENS160 es sensible a velocidades altas
 
+    /*
+    localizar dispositivos i2c. En mi caso detecto por 0x38 y 0x53
+    
     for (byte a = 1; a < 127; a++) {
         Wire.beginTransmission(a);
         if (Wire.endTransmission() == 0)
@@ -942,7 +946,7 @@ void setup()
         {
             LOG_PRINTF_P(PSTR("Nada encontrado en 0x%02X\n"), a);
         }
-    }
+    }*/
 
     loadConfig();
 
@@ -1007,14 +1011,14 @@ void setup()
     /* ── ENS160 ───────────────────────────────────────────────── */
     ens160.begin(&Wire, ENS160_I2C_ADDRESS);
 
-    LOG_PRINTLN(F("begin ens160.."));
+    LOG_PRINTF_P(PSTR("begin ens160.."));
     int retries = 0;
     bool initOk = ens160.init();
     LOG_PRINTF_P(PSTR("ENS160 init() = %d\n"), initOk);
 
     while (!initOk && retries < 20)
     {
-        LOG_PRINTLN(F("."));
+        LOG_PRINTF_P(PSTR("."));
         delay(1000);
         retries++;
     }
