@@ -31,7 +31,7 @@
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
-#include <ScioSense_ENS16x.h>
+#include "ScioSense_ENS160.h"
 #include <Adafruit_AHTX0.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
@@ -166,7 +166,7 @@ void logToFile(const char* msg);
 #define PIN_SOIL_VCC D6 // GPIO12 — alimentación del sensor
 
 /* ─── Objetos ─────────────────────────────────────────────────*/
-ENS160 ens160;
+ScioSense_ENS160 ens160(ENS160_I2C_ADDRESS); // 0x53..ENS160+AHT21
 Adafruit_AHTX0 aht;
 BearSSL::WiFiClientSecure wifiClient;
 PubSubClient mqtt(wifiClient);
@@ -400,7 +400,6 @@ void readSensors()
                 gTemp = evtTemp.temperature;
             if (!isnan(evtHum.relative_humidity))
                 gHumidity = evtHum.relative_humidity;
-            ens160.writeCompensation(gTemp, gHumidity);
         }
         else
         {
@@ -409,25 +408,29 @@ void readSensors()
     }
 
     /* 2. ENS160 */
-    if (gENSok)
+    if (gENSok && ens160.available())
     {
-        // ens160.wait();
-        if (ens160.update() == RESULT_OK)
-        {
-            if (ens160.hasNewData())
-            {
-                gAQI = ens160.getAirQualityIndex_UBA();
-                gTVOC = ens160.getTvoc();
-                gECO2 = ens160.getEco2();
-                gENSValid = true;
-            }
-        }
-        else
-        {
-            LOG_PRINTLN(F("[ENS160] error de lectura."));
-            gENSValid = false;
-        }
+
+        gENSValid = true;
+        // Give values to Air Quality Sensor.
+
+        ens160.set_envdata(gTemp, gHumidity);
+
+        ens160.measure(true);
+        ens160.measureRaw(true);
+
+        gAQI = ens160.getAQI();
+        gTVOC = ens160.getTVOC();
+        gECO2 = ens160.geteCO2();
     }
+    else
+    {
+        LOG_PRINTLN(F("[ENS160] error de lectura."));
+        gENSValid = false;
+    }
+
+    
+    
 
     /* 3. Sensor humedad suelo (A0, capacitivo)
      *  El ADC del NodeMCU v2 mide 0–3,3 V → valores 0–1023.
@@ -1009,20 +1012,21 @@ void setup()
     setupOTA();
 
     /* ── ENS160 ───────────────────────────────────────────────── */
-    ens160.begin(&Wire, ENS160_I2C_ADDRESS);
+    ens160.begin();
 
     LOG_PRINTF_P(PSTR("begin ens160.."));
-    int retries = 0;
-    bool initOk = ens160.init();
-    LOG_PRINTF_P(PSTR("ENS160 init() = %d\n"), initOk);
-
-    while (!initOk && retries < 20)
+    LOG_PRINTF_P(ens160.available() ? PSTR("done.") : PSTR("failed!"));
+    if (ens160.available())
     {
-        LOG_PRINTF_P(PSTR("."));
-        delay(1000);
-        retries++;
+        gENSok = true;
+        // Print ENS160 versions
+        LOG_PRINTF_P(PSTR("\tens160 RevMajor: %u."), ens160.getMajorRev());
+        LOG_PRINTF_P(PSTR("\tens160 RevMinor: %u."), ens160.getMinorRev());
+        LOG_PRINTF_P(PSTR("\tens160 RevBuild: %u."), ens160.getBuild());
+
+        LOG_PRINTF_P(PSTR("\tStandard mode "));
+        LOG_PRINTF_P(ens160.setMode(ENS160_OPMODE_STD) ? PSTR("done.") : PSTR("failed!"));
     }
-    gENSok = (retries < 20);
     if (!gENSok)
     {
         LOG_PRINTLN(F("Error: ENS160 no responde. Iniciando sin sensor."));
