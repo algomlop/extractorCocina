@@ -9,9 +9,8 @@
  *   ENS160 @ 0x53 → AQI (1–5) / TVOC (ppb) / eCO₂ (ppm)
  *   AHT21  @ 0x38 → Temperatura (°C) / Humedad relativa (%)
  *
- * D5 → Relay IN (GPIO14) – NO active-low  ← usa contacto Normalmente Abierto
- *   PIN LOW  → bobina activada  → NO cerrado → extractor ON
- *   PIN HIGH → bobina en reposo → NO abierto → extractor OFF  (fail-safe)
+ * D5 → Relay IN (GPIO14)  ← usa contacto Normalmente Abierto
+ *
  *
  * A0 → Sensor humedad suelo (capacitivo, 0–3,3 V):
  *   Raw alto (~820) = seco  →  0 % humedad suelo
@@ -30,6 +29,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
+#include <DNSServer.h>           // DNS captive-portal en modo AP
 #include <PubSubClient.h>
 #include "ScioSense_ENS160.h"
 #include <Adafruit_AHTX0.h>
@@ -59,7 +59,7 @@ void logToFile(const char* msg);
             TelnetStream.println(x);      \
         {                                 \
             String _s = String(x) + "\n"; \
-            logToFile(_s.c_str());        \
+            /*logToFile(_s.c_str());*/    \
         }                                 \
     }
 
@@ -68,7 +68,7 @@ void logToFile(const char* msg);
         Serial.println();           \
         if (telnetReady)            \
             TelnetStream.println(); \
-        logToFile("\n");            \
+        /*logToFile("\n");*/        \
     }
 
 #define LOG_PRINTF(fmt, ...)                                  \
@@ -79,13 +79,13 @@ void logToFile(const char* msg);
             char _buf[256];                                   \
             snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
             TelnetStream.print(_buf);                         \
-            logToFile(_buf);                                  \
+            /*logToFile(_buf);*/                              \
         }                                                     \
         else                                                  \
         {                                                     \
             char _buf[256];                                   \
             snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
-            logToFile(_buf);                                  \
+            /*logToFile(_buf);*/                              \
         }                                                     \
     }
 
@@ -97,7 +97,7 @@ void logToFile(const char* msg);
             snprintf_P(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
             if (telnetReady)                                    \
                 TelnetStream.print(_buf);                       \
-            logToFile(_buf);                                    \
+            /*logToFile(_buf);*/                                \
         }                                                       \
     }
 #define MAX_LOG_BYTES 16384UL // 16 KB — ajusta según tu LittleFS
@@ -131,7 +131,12 @@ void logToFile(const char* msg);
 #define INTERVAL_SENSOR 10000UL    // leer sensores cada 10 s
 #define INTERVAL_MQTT 60000UL      // publicar MQTT cada 60 s
 #define INTERVAL_RECONNECT 5000UL  // reintentar conexión MQTT cada 5 s
-#define INTERVAL_WIFI_WDT 120000UL // reiniciar si WiFi caído > 2 min
+#define INTERVAL_WIFI_WDT 120000UL // entrar en modo AP si WiFi caído > 2 min
+#define INTERVAL_AP_RECONNECT 60000UL // en modo AP, reintentar WiFi cada 60 s
+
+/* ─── AP WiFi ────────────────────────────────────────────────*/
+#define AP_SSID "ExtractorAP"
+
 
 /* ─── MQTT topics ─────────────────────────────────────────────*/
 #define BASE "extractor"
@@ -171,9 +176,15 @@ Adafruit_AHTX0 aht;
 BearSSL::WiFiClientSecure wifiClient;
 PubSubClient mqtt(wifiClient);
 ESP8266WebServer webServer(80);
+DNSServer dnsServer;  // captive portal en modo AP
 
 bool telnetReady = false;
 bool littleFSok=false;
+
+/* ─── Estado WiFi/AP ──────────────────────────────────────────*/
+bool gApMode = false;           // true = funcionando como AP (sin WiFi)
+bool gPortalRequested = false;  // true = usuario pidió portal WiFiManager
+unsigned long tApReconnect = 0; // temporizador de reintento en modo AP
 
 /* ─── Estado sensores ─────────────────────────────────────────*/
 uint8_t gAQI = 1;
@@ -268,6 +279,10 @@ void saveConfig()
 
 void logToFile(const char *msg)
 {
+    static uint16_t writesThisBoot = 0;
+    if (writesThisBoot > 500)
+        return; // Límite de seguridad por cada reinicio
+
     File f = LittleFS.open("/log.txt", "a");
     if (!f)
         return;
@@ -303,6 +318,27 @@ void logToFile(const char *msg)
 
     f.print(msg);
     f.close();
+}
+
+/* ══════════════════════════════════════════════════════════
+   WiFi – helpers
+   ══════════════════════════════════════════════════════════ */
+
+/**
+ * Activa el modo AP con SSID+contraseña y arranca el servidor DNS
+ * para redirigir cualquier dominio al portal cautivo (192.168.4.1).
+ */
+void startApMode()
+{
+    LOG_PRINTLN(F("Iniciando modo AP..."));
+    gApMode = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, SECRET_AP_PASS);
+    delay(100); // esperar a que el AP esté listo
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    tApReconnect = millis(); // primer intento de reconexión tras 60 s
+    LOG_PRINTF_P(PSTR("AP activo: %s  IP: %s\n"),
+                 AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -428,9 +464,6 @@ void readSensors()
         LOG_PRINTLN(F("[ENS160] error de lectura."));
         gENSValid = false;
     }
-
-    
-    
 
     /* 3. Sensor humedad suelo (A0, capacitivo)
      *  El ADC del NodeMCU v2 mide 0–3,3 V → valores 0–1023.
@@ -616,8 +649,10 @@ const char HTML[] PROGMEM = R"html(
   .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.8em;font-weight:700}
   .ba{background:#e3f2fd;color:#1565c0}.bm{background:#fff3e0;color:#e65100}
   .bc{background:#fce4ec;color:#c62828}.bw{background:#f3e5f5;color:#6a1b9a}
+  .bap{background:#fff8e1;color:#f57f17}
   button{padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:.9em;margin:3px 2px}
   .b-on{background:#2e7d32;color:#fff}.b-off{background:#c62828;color:#fff}.b-auto{background:#1565c0;color:#fff}
+  .b-wifi{background:#6a1b9a;color:#fff}
   input[type=number]{width:68px;padding:5px 7px;border:1px solid #ccc;border-radius:5px;font-size:.95em}
   .lbl{color:#666;font-size:.88em}
   .tbox{background:#f5f5f5;border-radius:8px;padding:8px 10px;margin-top:8px}
@@ -625,8 +660,15 @@ const char HTML[] PROGMEM = R"html(
   /* Barra de humedad suelo */
   .soil-bar-wrap{flex:1;margin:0 10px;height:10px;background:#e0e0e0;border-radius:5px;overflow:hidden}
   .soil-bar{height:100%;border-radius:5px;transition:width .6s,background .6s}
+  /* Banner AP */
+  .ap-banner{background:#fff3e0;border:1px solid #ffb300;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:.88em;color:#e65100}
 </style></head><body>
 <h2>Extractor</h2>
+
+<div id="ap-banner" class="ap-banner" style="display:none">
+  ⚠️ <strong>Modo AP activo</strong> — sin conexión WiFi.<br>
+  IP: <span id="vip">192.168.4.1</span> &nbsp;|&nbsp; Reintentar cada 60 s.
+</div>
 
 <div class="card">
   <h3>Calidad del aire</h3>
@@ -699,15 +741,26 @@ const char HTML[] PROGMEM = R"html(
     </div>
   </div>
 </div>
+
 <div class="card">
   <h3>Logs</h3>
-  <p class="note"><a href="/log" target="_blank" style="font-size:.85em;color:#1565c0">📋 Ver log</a></p>
-  
+  <p class="note"><a href="/log" target="_blank" style="font-size:.85em;color:#1565c0">📋 Ver log (desactivado por código para evitar demasiadas sobrescrituras en la flash)</a></p>
 </div>
 
-
-
-
+<div class="card">
+  <h3>🔧 Red WiFi</h3>
+  <div class="row">
+    <span class="lbl">IP actual</span>
+    <span id="vip-sta" class="val" style="font-size:1em">–</span>
+  </div>
+  <div style="margin-top:8px">
+    <button class="b-wifi" onclick="wifiPortal()">⚙️ Configurar WiFi</button>
+  </div>
+  <p class="note" style="margin-top:6px">
+    Abre el portal WiFiManager (AP: <strong>ExtractorAP</strong>).<br>
+    El dispositivo se reiniciará tras configurar o en 3 min.
+  </p>
+</div>
 
 <script>
 var AQI_LBL=['','Buena','Moderada','Sensible','Mala','Pésima'];
@@ -742,10 +795,27 @@ function refresh(){
     document.getElementById('t3').value=d.t3;
     document.getElementById('ton').value=d.ton;
     document.getElementById('tof').value=d.tof;
+    // Red
+    if(d.ip) document.getElementById('vip-sta').textContent=d.ip;
+    var banner=document.getElementById('ap-banner');
+    var vip=document.getElementById('vip');
+    if(d.ap){
+      banner.style.display='block';
+      if(d.ip) vip.textContent=d.ip;
+    } else {
+      banner.style.display='none';
+    }
   }).catch(()=>{});
 }
 function cmd(u){fetch(u).then(refresh);}
 function setV(id){cmd('/set?'+id+'='+document.getElementById(id).value);}
+function wifiPortal(){
+  if(confirm('¿Abrir portal de configuración WiFi?\n\nEl dispositivo activará el AP "ExtractorAP" y se reiniciará al terminar.')){
+    fetch('/wifi').then(()=>{
+      alert('Portal iniciado.\nConéctate al AP "ExtractorAP" y abre 192.168.4.1');
+    });
+  }
+}
 refresh(); setInterval(refresh,8000);
 </script></body></html>
 )html";
@@ -769,6 +839,9 @@ void handleApi()
     doc["t3"] = gThresh3;
     doc["ton"] = gTimerOnMin;
     doc["tof"] = gTimerOffMin;
+    // Info de red
+    doc["ap"] = gApMode;
+    doc["ip"] = gApMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
     String out;
     serializeJson(doc, out);
     webServer.send(200, "application/json", out);
@@ -828,6 +901,31 @@ void handleSet()
 }
 
 /* ══════════════════════════════════════════════════════════
+   Web – portal WiFiManager (endpoint /wifi)
+   ══════════════════════════════════════════════════════════ */
+void handleWifiPortal()
+{
+    // Enviar respuesta antes de activar el flag
+    webServer.send(200, "text/html",
+        F("<!DOCTYPE html><html><head>"
+          "<meta charset=UTF-8>"
+          "<meta name=viewport content='width=device-width,initial-scale=1'>"
+          "<title>WiFi – Extractor</title>"
+          "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:16px}"
+          "h2{color:#6a1b9a}p{line-height:1.6}strong{color:#333}</style>"
+          "</head><body>"
+          "<h2>⚙️ Portal WiFi iniciando...</h2>"
+          "<p>En unos segundos se activará el AP <strong>ExtractorAP</strong>.</p>"
+          "<p>Conéctate a ese AP (contraseña: la configurada) y navega a "
+          "<strong>192.168.4.1</strong> para configurar el WiFi.</p>"
+          "<p>El portal expira en <strong>3 minutos</strong>; "
+          "el dispositivo se reiniciará automáticamente.</p>"
+          "<p><small>Si no aparece el portal, navega manualmente a 192.168.4.1</small></p>"
+          "</body></html>"));
+    gPortalRequested = true;
+}
+
+/* ══════════════════════════════════════════════════════════
    OTA
    ══════════════════════════════════════════════════════════ */
 void setupOTA()
@@ -843,15 +941,18 @@ void setupOTA()
 
     ArduinoOTA.setHostname("extractor-esp");
     ArduinoOTA.onStart([]()
-                       {
-    WiFi.setSleepMode(WIFI_NONE_SLEEP); // radio siempre activa durante OTA
-    LOG_PRINTLN(F("OTA: inicio")); });
+    {
+        // Radio siempre activa (ya está en WIFI_NONE_SLEEP permanente)
+        LOG_PRINTLN(F("OTA: inicio"));
+    });
     ArduinoOTA.onEnd([]()
-                     {
-    WiFi.setSleepMode(WIFI_MODEM_SLEEP); // vuelve a dormir al terminar
-    LOG_PRINTLN(F("\nOTA: fin")); });
+    {
+        LOG_PRINTLN(F("\nOTA: fin"));
+    });
     ArduinoOTA.onError([](ota_error_t e)
-                       { LOG_PRINTF_P(PSTR("OTA error [%u]\n"), e); });
+    {
+        LOG_PRINTF_P(PSTR("OTA error [%u]\n"), e);
+    });
     ArduinoOTA.begin();
     LOG_PRINTLN(F("OTA listo → 'extractor-esp'."));
 }
@@ -936,79 +1037,89 @@ void setup()
     Wire.begin(D2, D1);    // SDA=D2(GPIO4), SCL=D1(GPIO5)
     Wire.setClock(100000); // bajar a 100 kHz — el ENS160 es sensible a velocidades altas
 
-    /*
-    localizar dispositivos i2c. En mi caso detecto por 0x38 y 0x53
-    
-    for (byte a = 1; a < 127; a++) {
-        Wire.beginTransmission(a);
-        if (Wire.endTransmission() == 0)
-        {
-            LOG_PRINTF_P(PSTR("Dispositivo en 0x%02X\n"), a);
-        }
-        else
-        {
-            LOG_PRINTF_P(PSTR("Nada encontrado en 0x%02X\n"), a);
-        }
-    }*/
-
     loadConfig();
 
-    /* ── WiFiManager ─────────────────────────────────────────────*/
-    WiFi.persistent(false);
+    /* ── WiFi: potencia máxima, sin sleep ──────────────────────── */
+    WiFi.persistent(false);          // no desgastar flash en cada reconexión
     WiFi.hostname("extractor-esp");
-    /* D3 pulsado en boot → forzar portal de configuración        */
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);   // radio siempre activa — sin latencia
+    //WiFi.setOutputPower(20.5f);           // máxima potencia TX (20.5 dBm)
+    //WiFi.setPhyMode(WIFI_PHY_MODE_11N);  // modo 802.11n para mejor rendimiento
+    WiFi.setAutoReconnect(true);
+
+    /* ── Comprobar pin de forzado de portal ─────────────────────── */
     pinMode(PIN_CFG_FORCE, INPUT_PULLUP);
     bool forcePortal = (digitalRead(PIN_CFG_FORCE) == LOW);
     if (forcePortal)
         LOG_PRINTLN(F("PIN_CFG_FORCE activo → forzando portal WiFi."));
 
-    WiFiManager wm;
-    wm.setConfigPortalTimeout(180);
-    wm.setHostname("extractor-esp");
-
-    bool connected;
+    /* ── Portal forzado por pin físico ─────────────────────────── */
     if (forcePortal)
     {
-        connected = wm.startConfigPortal("ExtractorAP");
+        LOG_PRINTLN(F("Iniciando portal WiFiManager (forzado por pin)..."));
+        WiFiManager wm;
+        wm.setConfigPortalTimeout(180);
+        wm.setHostname("extractor-esp");
+        // startConfigPortal es bloqueante hasta que se configure o expire
+        if (wm.startConfigPortal(AP_SSID, SECRET_AP_PASS))
+        {
+            LOG_PRINTLN(F("Portal: WiFi configurado correctamente."));
+        }
+        else
+        {
+            LOG_PRINTLN(F("Portal: expirado sin configurar."));
+        }
+        // Continuar igualmente — intentar conectar con lo que haya
+    }
+
+    /* ── Intentar conectar con credenciales guardadas (máx. 20 s) ─ */
+    LOG_PRINTLN(F("Conectando a WiFi guardado..."));
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(); // usa las credenciales almacenadas por WiFiManager
+    {
+        unsigned long t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000UL)
+        {
+            delay(200);
+            yield();
+        }
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        gApMode = false;
+        LOG_PRINT(F("WiFi OK: "));
+        LOG_PRINTLN(WiFi.localIP().toString().c_str());
+        LOG_PRINTF_P(PSTR("Heap libre tras WiFi: %u bytes\n"), ESP.getFreeHeap());
     }
     else
     {
-        connected = wm.autoConnect("ExtractorAP");
+        LOG_PRINTLN(F("Sin WiFi → arrancando en modo AP."));
+        startApMode();
     }
 
-    if (!connected)
-    {
-        LOG_PRINTLN(F("Sin WiFi – reiniciando en 5s…"));
-        delay(5000);
-        ESP.restart();
-    }
-
-    LOG_PRINT(F("WiFi OK: "));
-    LOG_PRINTLN(WiFi.localIP().toString().c_str());
-
-    WiFi.setSleepMode(WIFI_MODEM_SLEEP);
-    WiFi.setAutoReconnect(true);
-
+    /* ── TelnetStream (solo útil en modo STA, en AP conectar al AP) */
     TelnetStream.begin();
     telnetReady = true;
 
-    LOG_PRINTF_P(PSTR("Heap libre tras WiFi: %u bytes\n"), ESP.getFreeHeap());
-
-    /* ── MQTT sobre TLS (puerto 8883) – sin verificar certificado */
+    /* ── MQTT sobre TLS (puerto 8883) – sin verificar certificado  */
     wifiClient.setInsecure();
-
     mqtt.setServer(cfgHost, atoi(cfgPort));
     mqtt.setCallback(mqttCallback);
     mqtt.setKeepAlive(60);
     mqtt.setBufferSize(256);
 
+    /* ── Rutas del servidor web ─────────────────────────────────── */
     webServer.on("/", handleRoot);
     webServer.on("/api", handleApi);
     webServer.on("/set", handleSet);
     webServer.on("/log", handleLog);
     webServer.on("/log/clear", handleLogClear);
+    webServer.on("/wifi", handleWifiPortal);   // ← nuevo: portal WiFiManager
     webServer.begin();
+    LOG_PRINTLN(F("WebServer iniciado en puerto 80."));
 
+    /* ── OTA ─────────────────────────────────────────────────────*/
     setupOTA();
 
     /* ── ENS160 ───────────────────────────────────────────────── */
@@ -1055,31 +1166,114 @@ void setup()
    ══════════════════════════════════════════════════════════ */
 void loop()
 {
-    if (WiFi.status() != WL_CONNECTED)
+    /* ── Portal WiFiManager solicitado desde la web ─────────────
+     * Se procesa al inicio del loop para que la respuesta HTTP
+     * haya sido enviada en la iteración anterior.               */
+    if (gPortalRequested)
     {
-        if (!wifiWasLost)
+        gPortalRequested = false;
+        LOG_PRINTLN(F("Iniciando portal WiFiManager solicitado por web..."));
+        webServer.stop();
+        dnsServer.stop(); // detener DNS propio (WiFiManager lanzará el suyo)
+        WiFiManager wm;
+        wm.setConfigPortalTimeout(180);
+        wm.setHostname("extractor-esp");
+        if (wm.startConfigPortal(AP_SSID, SECRET_AP_PASS))
         {
-            wifiWasLost = true;
-            tWifiLost = millis();
-            LOG_PRINTLN(F("WiFi desconectado."));
+            LOG_PRINTLN(F("Portal: WiFi configurado → reiniciando."));
         }
-        else if (millis() - tWifiLost > INTERVAL_WIFI_WDT)
+        else
         {
-            LOG_PRINTLN(F("WiFi perdido > 2 min → reiniciando."));
-            ESP.restart();
+            LOG_PRINTLN(F("Portal: expirado → reiniciando."));
+        }
+        delay(500);
+        ESP.restart();
+    }
+
+    /* ── Gestión de conectividad WiFi ─────────────────────────── */
+    if (gApMode)
+    {
+        // Procesar peticiones DNS del captive portal
+        dnsServer.processNextRequest();
+
+        // Cada 60 s intentar reconectar al WiFi
+        if (millis() - tApReconnect >= INTERVAL_AP_RECONNECT)
+        {
+            tApReconnect = millis();
+            LOG_PRINTLN(F("AP: probando reconexión WiFi..."));
+
+            dnsServer.stop();
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(); // intenta con credenciales guardadas
+
+            unsigned long t = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - t < 10000UL)
+            {
+                delay(200);
+                yield();
+            }
+
+            if (WiFi.status() == WL_CONNECTED)
+            {
+                LOG_PRINT(F("WiFi recuperado: "));
+                LOG_PRINTLN(WiFi.localIP().toString().c_str());
+                LOG_PRINTLN(F("Reiniciando en modo normal..."));
+                delay(500);
+                ESP.restart(); // reinicio limpio en modo normal
+            }
+            else
+            {
+                // No conectó: volver al modo AP
+                LOG_PRINTLN(F("Sin WiFi — continuando en modo AP."));
+                WiFi.mode(WIFI_AP);
+                WiFi.softAP(AP_SSID, SECRET_AP_PASS);
+                delay(100);
+                dnsServer.start(53, "*", WiFi.softAPIP());
+            }
         }
     }
     else
     {
-        wifiWasLost = false;
+        /* ── Modo normal (STA): vigilar pérdida de WiFi ───────── */
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            if (!wifiWasLost)
+            {
+                wifiWasLost = true;
+                tWifiLost = millis();
+                LOG_PRINTLN(F("WiFi desconectado."));
+            }
+            else if (millis() - tWifiLost > INTERVAL_WIFI_WDT)
+            {
+                LOG_PRINTLN(F("WiFi perdido > 2 min → modo AP."));
+                wifiWasLost = false;
+                // Detener lo que dependa del WiFi
+                mqtt.disconnect();
+                // Iniciar modo AP y reiniciar webServer en el nuevo entorno
+                webServer.stop();
+                startApMode();
+                webServer.begin();
+            }
+        }
+        else
+        {
+            wifiWasLost = false;
+        }
     }
 
+    /* ── Servicios comunes ──────────────────────────────────────*/
     ArduinoOTA.handle();
     MDNS.update();
     webServer.handleClient();
-    mqttReconnect();
-    mqtt.loop();
 
+    /* ── MQTT solo en modo normal (necesita acceso a internet/LAN)*/
+    if (!gApMode)
+    {
+        mqttReconnect();
+        mqtt.loop();
+    }
+
+    /* ── Sensores y publicación periódica ───────────────────────*/
     unsigned long now = millis();
 
     if (now - tSensor >= INTERVAL_SENSOR)
