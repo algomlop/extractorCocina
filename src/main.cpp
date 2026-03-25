@@ -1043,7 +1043,7 @@ void setup()
     WiFi.persistent(false);          // no desgastar flash en cada reconexión
     WiFi.hostname("extractor-esp");
     WiFi.setSleepMode(WIFI_NONE_SLEEP);   // radio siempre activa — sin latencia
-    WiFi.setOutputPower(20.5f);           // máxima potencia TX (20.5 dBm)
+    WiFi.setOutputPower(17.5f);
     WiFi.setPhyMode(WIFI_PHY_MODE_11N);  // modo 802.11n para mejor rendimiento
     WiFi.setAutoReconnect(true);
 
