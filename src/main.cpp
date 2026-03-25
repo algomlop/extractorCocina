@@ -1043,8 +1043,8 @@ void setup()
     WiFi.persistent(false);          // no desgastar flash en cada reconexión
     WiFi.hostname("extractor-esp");
     WiFi.setSleepMode(WIFI_NONE_SLEEP);   // radio siempre activa — sin latencia
-    //WiFi.setOutputPower(20.5f);           // máxima potencia TX (20.5 dBm)
-    //WiFi.setPhyMode(WIFI_PHY_MODE_11N);  // modo 802.11n para mejor rendimiento
+    WiFi.setOutputPower(20.5f);           // máxima potencia TX (20.5 dBm)
+    WiFi.setPhyMode(WIFI_PHY_MODE_11N);  // modo 802.11n para mejor rendimiento
     WiFi.setAutoReconnect(true);
 
     /* ── Comprobar pin de forzado de portal ─────────────────────── */
@@ -1115,7 +1115,7 @@ void setup()
     webServer.on("/set", handleSet);
     webServer.on("/log", handleLog);
     webServer.on("/log/clear", handleLogClear);
-    webServer.on("/wifi", handleWifiPortal);   // ← nuevo: portal WiFiManager
+    webServer.on("/wifi", handleWifiPortal); 
     webServer.begin();
     LOG_PRINTLN(F("WebServer iniciado en puerto 80."));
 
