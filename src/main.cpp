@@ -29,7 +29,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
-#include <DNSServer.h>           // DNS captive-portal en modo AP
+#include <DNSServer.h>
 #include <PubSubClient.h>
 #include "ScioSense_ENS160.h"
 #include <Adafruit_AHTX0.h>
@@ -40,68 +40,157 @@
 #include <ESP8266mDNS.h>
 #include "include/secrets.h"
 #include <TelnetStream.h>
+#include <time.h>
 
+// comentado a proposito. ESCRITURA EN FLASH DESACTIVADA PARA EVITAR DESGASTE
+// void logToFile(const char *msg);
 
-void logToFile(const char* msg);
+bool timeOK = false;
+struct tm timeinfo;
+bool telnetReady = false;
 
-#define LOG_PRINT(x)                                                           \
-    {                                                                          \
-        Serial.print(x);                                                       \
-        if (telnetReady)                                                       \
-            TelnetStream.print(x);                                             \
-        /* LOG_PRINT no escribe a fichero — sin newline, se acumularía roto */ \
+#define RTC_MAGIC 0xCAFE1234UL
+
+struct RTCCrashInfo
+{
+    uint32_t magic;      // RTC_MAGIC si los datos son válidos
+    uint32_t resetCount; // reinicios consecutivos anómalos
+    uint32_t reason;     // rst_reason del SDK (0=power-on, 6=exception, etc.)
+    uint32_t exccause;   // causa de excepción (solo válida si reason==6)
+    char lastMsg[76];    // último mensaje LOG antes del crash
+    uint32_t crc;        // suma de comprobación sencilla
+    // Total: 4+4+4+4+76+4 = 96 bytes = 24 words (múltiplo de 4 ✓)
+};
+
+static bool gCrashInfoValid = false;
+
+static RTCCrashInfo gCrashInfo;
+
+static uint32_t rtcCrc(const RTCCrashInfo &d)
+{
+    uint32_t c = 0;
+    const uint8_t *p = (const uint8_t *)&d;
+    for (size_t i = 0; i < offsetof(RTCCrashInfo, crc); i++)
+        c += p[i];
+    return c;
+}
+
+// Llama a esto desde LOG_PRINTLN antes de un punto crítico,
+// o usa updateRTCLastMsg() periódicamente para dejar rastro.
+void updateRTCLastMsg(const char *msg)
+{
+    if (!msg)
+        return;
+    struct rst_info *ri = ESP.getResetInfoPtr();
+    gCrashInfo.magic = RTC_MAGIC;
+    gCrashInfo.reason = ri ? ri->reason : 0;
+    gCrashInfo.exccause = ri ? ri->exccause : 0;
+    // No incrementamos resetCount aquí; lo hace el arranque si detecta crash.
+    strncpy(gCrashInfo.lastMsg, msg, sizeof(gCrashInfo.lastMsg) - 1);
+    gCrashInfo.lastMsg[sizeof(gCrashInfo.lastMsg) - 1] = '\0';
+    gCrashInfo.crc = rtcCrc(gCrashInfo);
+    ESP.rtcUserMemoryWrite(0, (uint32_t *)&gCrashInfo, sizeof(gCrashInfo));
+}
+
+//  Helper para obtener el timestamp según disponibilidad de hora
+String getLogHeader()
+{
+    char header[32];
+    if (timeOK && getLocalTime(&timeinfo))
+    {
+        strftime(header, sizeof(header), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    }
+    else
+    {
+        snprintf(header, sizeof(header), "%8lums", millis());
+    }
+    return "[" + String(header) + "] ";
+}
+
+// Función centralizada de logging
+void logLine(const char *msg)
+{
+    if (!msg || msg[0] == '\0')
+        return;
+
+    // 1. "Caja Negra" (RTC): Guardamos el mensaje actual
+    // por si el sistema crashea en el siguiente paso.
+    updateRTCLastMsg(msg);
+
+    // 2. Formatear para salida visual
+    String header = getLogHeader();
+    String fullMsg = header + msg;
+
+    // 3. Salidas volátiles (No escriben en disco)
+    Serial.print(fullMsg);
+    if (telnetReady)
+        TelnetStream.print(fullMsg);
+
+    // 4. Flash (COMENTADO para no degradar memoria)
+    // logToFile(fullMsg.c_str());
+}
+
+#define LOG_PRINT(x) logLine(String(x).c_str())
+
+#define LOG_PRINTLN(x)                \
+    {                                 \
+        String _s = String(x) + "\n"; \
+        logLine(_s.c_str());          \
     }
 
-#define LOG_PRINTLN(x)                    \
-    {                                     \
-        Serial.println(x);                \
-        if (telnetReady)                  \
-            TelnetStream.println(x);      \
-        {                                 \
-            String _s = String(x) + "\n"; \
-            /*logToFile(_s.c_str());*/    \
-        }                                 \
+#define LOG_PRINTLN0() logLine("\n")
+
+#define LOG_PRINTF(fmt, ...)                              \
+    {                                                     \
+        char _buf[256];                                   \
+        snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
+        logLine(_buf);                                    \
     }
 
-#define LOG_PRINTLN0()              \
-    {                               \
-        Serial.println();           \
-        if (telnetReady)            \
-            TelnetStream.println(); \
-        /*logToFile("\n");*/        \
+#define LOG_PRINTF_P(fmt, ...)                              \
+    {                                                       \
+        char _buf[256];                                     \
+        snprintf_P(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
+        logLine(_buf);                                      \
     }
 
-#define LOG_PRINTF(fmt, ...)                                  \
-    {                                                         \
-        Serial.printf(fmt, ##__VA_ARGS__);                    \
-        if (telnetReady)                                      \
-        {                                                     \
-            char _buf[256];                                   \
-            snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
-            TelnetStream.print(_buf);                         \
-            /*logToFile(_buf);*/                              \
-        }                                                     \
-        else                                                  \
-        {                                                     \
-            char _buf[256];                                   \
-            snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
-            /*logToFile(_buf);*/                              \
-        }                                                     \
+/* --- FUNCIÓN LOGTOFILE MODIFICADA (COMENTADA) --- ESCRITURA EN FLASH DESACTIVADA PARA EVITAR DESGASTE --- */
+
+/*void logToFile(const char *msg)
+{
+
+    static uint16_t writesThisBoot = 0;
+    if (writesThisBoot > 500) return;
+
+    File f = LittleFS.open("/log.txt", "a");
+    if (!f) return;
+
+    if (f.size() >= MAX_LOG_BYTES) {
+        f.close();
+        File src = LittleFS.open("/log.txt", "r");
+        File dst = LittleFS.open("/log.tmp", "w");
+        if (src && dst) {
+            src.seek(MAX_LOG_BYTES / 2);
+            uint8_t chunk[256];
+            while (src.available()) {
+                size_t n = src.read(chunk, sizeof(chunk));
+                dst.write(chunk, n);
+            }
+        }
+        src.close();
+        dst.close();
+        LittleFS.remove("/log.txt");
+        LittleFS.rename("/log.tmp", "/log.txt");
+        f = LittleFS.open("/log.txt", "a");
+        if (!f) return;
     }
 
-#define LOG_PRINTF_P(fmt, ...)                                  \
-    {                                                           \
-        Serial.printf_P(fmt, ##__VA_ARGS__);                    \
-        {                                                       \
-            char _buf[256];                                     \
-            snprintf_P(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
-            if (telnetReady)                                    \
-                TelnetStream.print(_buf);                       \
-            /*logToFile(_buf);*/                                \
-        }                                                       \
-    }
+    f.print(msg);
+    f.close();
+    writesThisBoot++;
+
+}*/
 #define MAX_LOG_BYTES 16384UL // 16 KB — ajusta según tu LittleFS
-
 
 /* ─── Pins ────────────────────────────────────────────────────
  * I2C usa D1(SCL/GPIO5) y D2(SDA/GPIO4) — pines Wire por defecto.
@@ -128,15 +217,14 @@ void logToFile(const char* msg);
 #define HYST_SOIL 5.0f // ±5 % humedad suelo
 
 /* ─── Intervalos ──────────────────────────────────────────────*/
-#define INTERVAL_SENSOR 10000UL    // leer sensores cada 10 s
-#define INTERVAL_MQTT 60000UL      // publicar MQTT cada 60 s
-#define INTERVAL_RECONNECT 5000UL  // reintentar conexión MQTT cada 5 s
-#define INTERVAL_WIFI_WDT 120000UL // entrar en modo AP si WiFi caído > 2 min
-#define INTERVAL_AP_RECONNECT 60000UL // en modo AP, reintentar WiFi cada 60 s
+#define INTERVAL_SENSOR 10000UL        // leer sensores cada 10 s
+#define INTERVAL_MQTT 60000UL          // publicar MQTT cada 60 s
+#define INTERVAL_RECONNECT 5000UL      // reintentar conexión MQTT cada 5 s
+#define INTERVAL_WIFI_WDT 180000UL     // entrar en modo AP si WiFi caído > 3 min
+#define INTERVAL_AP_RECONNECT 180000UL // en modo AP, reintentar WiFi cada 3 min
 
 /* ─── AP WiFi ────────────────────────────────────────────────*/
 #define AP_SSID "ExtractorAP"
-
 
 /* ─── MQTT topics ─────────────────────────────────────────────*/
 #define BASE "extractor"
@@ -170,16 +258,18 @@ void logToFile(const char* msg);
 
 #define PIN_SOIL_VCC D6 // GPIO12 — alimentación del sensor
 
+#define MY_NTP_SERVER "pool.ntp.org"
+#define MY_TZ "CET-1CEST,M3.5.0/02,M10.5.0/03" // for Central Europe
+
 /* ─── Objetos ─────────────────────────────────────────────────*/
 ScioSense_ENS160 ens160(ENS160_I2C_ADDRESS); // 0x53..ENS160+AHT21
 Adafruit_AHTX0 aht;
 BearSSL::WiFiClientSecure wifiClient;
 PubSubClient mqtt(wifiClient);
 ESP8266WebServer webServer(80);
-DNSServer dnsServer;  // captive portal en modo AP
+DNSServer dnsServer; // captive portal en modo AP
 
-bool telnetReady = false;
-bool littleFSok=false;
+bool littleFSok = false;
 
 /* ─── Estado WiFi/AP ──────────────────────────────────────────*/
 bool gApMode = false;           // true = funcionando como AP (sin WiFi)
@@ -226,6 +316,105 @@ unsigned long tWifiLost = 0;
 bool wifiWasLost = false;
 
 /* ══════════════════════════════════════════════════════════
+   WiFi Test (/testwifi)
+   Prueba 3 modos PHY × niveles de potencia
+   State machine no bloqueante: avanza en loop().
+   Los resultados se guardan en /wifitest.json (LittleFS).
+   ══════════════════════════════════════════════════════════ */
+
+static const WiFiPhyMode_t kWtModes[] = {WIFI_PHY_MODE_11B, WIFI_PHY_MODE_11G, WIFI_PHY_MODE_11N};
+static const float kWtPowers[] = {5.0f, 10.0f, 15.0f, 17.5f, 18.5f, 19.5f, 20.5f};
+#define WTEST_N_MODES 3
+#define WTEST_N_POWERS 7
+#define WTEST_TOTAL (WTEST_N_MODES * WTEST_N_POWERS) // 12
+
+// Códigos de error por paso
+#define WTEST_ERR_OK 0         // sin error
+#define WTEST_ERR_TIMEOUT 1    // timeout de conexión WiFi
+#define WTEST_ERR_SPEED 2      // test de velocidad fallido
+#define WTEST_ERR_GLOBAL_TMO 3 // test abortado por timeout global
+#define WTEST_ERR_ABORTED 4    // abortado (p.ej. reinicio inesperado)
+
+// Timeout global: si el test no termina en este tiempo, se aborta y se guarda el estado
+#define WTEST_GLOBAL_TIMEOUT_MS (12UL * 60UL * 1000UL) // 12 minutos
+
+struct WifiTestEntry
+{
+    uint8_t phyMode;     // 1=11b 2=11g 3=11n
+    float power;         // dBm
+    bool connected;      // ¿logró conectar?
+    int8_t rssi;         // dBm señal (0 si no conectó)
+    uint16_t connectMs;  // ms hasta WL_CONNECTED
+    int32_t downloadBps; // bytes/s promedio (-1 = sin dato)
+    uint8_t errCode;     // WTEST_ERR_* — motivo de fallo (0=OK)
+};
+
+enum WtPhase
+{
+    WTP_IDLE,
+    WTP_START_DELAY,
+    WTP_CONNECT,
+    WTP_WAITING,
+    WTP_SPEED,
+    WTP_DONE_STEP,
+    WTP_RESTORE_WAIT
+};
+
+WifiTestEntry gWtResults[WTEST_TOTAL];
+int gWtStep = 0;
+bool gWtRunning = false;
+bool gWtDone = false; // ¿hay resultados cargados/terminados?
+String gWtTimestamp = "";
+WtPhase gWtPhase = WTP_IDLE;
+unsigned long gWtPhaseTimer = 0;
+
+// Configuración original del WiFi para restaurar al terminar
+uint8_t gWtOrigPhyMode = WIFI_PHY_MODE_11B;
+float gWtOrigPower = 18.5f;
+
+unsigned long gWtStartTime = 0; // para vigilar el timeout global del test
+
+/* ══════════════════════════════════════════════════════════
+   RTC crash tracking – sobrevive reinicios (no apagados)
+   Usa los 256 bytes de user RTC memory del ESP8266.
+   ══════════════════════════════════════════════════════════ */
+
+void loadRTCCrash()
+{
+    RTCCrashInfo tmp;
+    ESP.rtcUserMemoryRead(0, (uint32_t *)&tmp, sizeof(tmp));
+    if (tmp.magic == RTC_MAGIC && tmp.crc == rtcCrc(tmp))
+    {
+        gCrashInfo = tmp;
+        gCrashInfoValid = true;
+    }
+}
+
+// Nombres legibles del rst_reason del SDK ESP8266
+static const char *rstReasonStr(uint32_t r)
+{
+    switch (r)
+    {
+    case 0:
+        return "power-on";
+    case 1:
+        return "hw-watchdog";
+    case 2:
+        return "exception";
+    case 3:
+        return "sw-watchdog";
+    case 4:
+        return "soft-restart";
+    case 5:
+        return "deep-sleep-wake";
+    case 6:
+        return "ext-reset";
+    default:
+        return "unknown";
+    }
+}
+
+/* ══════════════════════════════════════════════════════════
    LittleFS – carga y guardado de configuración
    ══════════════════════════════════════════════════════════ */
 void loadConfig()
@@ -259,7 +448,7 @@ void saveConfig()
 {
     if (!littleFSok)
     {
-        LOG_PRINTF_P(PSTR("El begin del LittleFS no funcionó")); 
+        LOG_PRINTF_P(PSTR("El begin del LittleFS no funcionó"));
         return;
     }
     File f = LittleFS.open("/cfg.json", "w");
@@ -274,50 +463,6 @@ void saveConfig()
     serializeJson(doc, f);
     f.close();
     LOG_PRINTLN(F("Config guardado."));
-}
-
-
-void logToFile(const char *msg)
-{
-    static uint16_t writesThisBoot = 0;
-    if (writesThisBoot > 500)
-        return; // Límite de seguridad por cada reinicio
-
-    File f = LittleFS.open("/log.txt", "a");
-    if (!f)
-        return;
-
-    // Rotación si supera el límite
-    if (f.size() >= MAX_LOG_BYTES)
-    {
-        f.close();
-
-        // Copiar la 2ª mitad a /log.tmp en chunks (RAM mínima)
-        File src = LittleFS.open("/log.txt", "r");
-        File dst = LittleFS.open("/log.tmp", "w");
-        if (src && dst)
-        {
-            src.seek(MAX_LOG_BYTES / 2);
-            uint8_t chunk[256];
-            while (src.available())
-            {
-                size_t n = src.read(chunk, sizeof(chunk));
-                dst.write(chunk, n);
-            }
-        }
-        src.close();
-        dst.close();
-
-        LittleFS.remove("/log.txt");
-        LittleFS.rename("/log.tmp", "/log.txt");
-
-        f = LittleFS.open("/log.txt", "a");
-        if (!f)
-            return;
-    }
-
-    f.print(msg);
-    f.close();
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -633,133 +778,58 @@ bool mqttReconnect()
    ══════════════════════════════════════════════════════════ */
 const char HTML[] PROGMEM = R"html(
 <!DOCTYPE html><html lang="es"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Extractor</title>
-<style>
-  *{box-sizing:border-box}
-  body{font-family:sans-serif;max-width:440px;margin:0 auto;padding:16px;background:#f0f2f5}
-  h2{margin:0 0 14px;color:#222}
-  .card{background:#fff;border-radius:12px;padding:14px 16px;margin:10px 0;box-shadow:0 1px 4px #0001}
-  .card h3{margin:0 0 10px;font-size:.95em;color:#555}
-  .row{display:flex;justify-content:space-between;align-items:center;margin:6px 0}
-  .val{font-size:1.2em;font-weight:700;color:#1565c0}
-  .aqi1{color:#2e7d32}.aqi2{color:#558b2f}.aqi3{color:#f57f17}.aqi4{color:#e65100}.aqi5{color:#c62828}
-  .on{color:#2e7d32;font-weight:700}.off{color:#aaa;font-weight:700}
-  .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.8em;font-weight:700}
-  .ba{background:#e3f2fd;color:#1565c0}.bm{background:#fff3e0;color:#e65100}
-  .bc{background:#fce4ec;color:#c62828}.bw{background:#f3e5f5;color:#6a1b9a}
-  .bap{background:#fff8e1;color:#f57f17}
-  button{padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:.9em;margin:3px 2px}
-  .b-on{background:#2e7d32;color:#fff}.b-off{background:#c62828;color:#fff}.b-auto{background:#1565c0;color:#fff}
-  .b-wifi{background:#6a1b9a;color:#fff}
-  input[type=number]{width:68px;padding:5px 7px;border:1px solid #ccc;border-radius:5px;font-size:.95em}
-  .lbl{color:#666;font-size:.88em}
-  .tbox{background:#f5f5f5;border-radius:8px;padding:8px 10px;margin-top:8px}
-  .note{font-size:.8em;color:#999;margin:4px 0 8px}
-  /* Barra de humedad suelo */
-  .soil-bar-wrap{flex:1;margin:0 10px;height:10px;background:#e0e0e0;border-radius:5px;overflow:hidden}
-  .soil-bar{height:100%;border-radius:5px;transition:width .6s,background .6s}
-  /* Banner AP */
-  .ap-banner{background:#fff3e0;border:1px solid #ffb300;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:.88em;color:#e65100}
-</style></head><body>
+</head><body>
 <h2>Extractor</h2>
 
-<div id="ap-banner" class="ap-banner" style="display:none">
-  ⚠️ <strong>Modo AP activo</strong> — sin conexión WiFi.<br>
-  IP: <span id="vip">192.168.4.1</span> &nbsp;|&nbsp; Reintentar cada 60 s.
+<div id="ap-banner" style="display:none">
+  ⚠️ Modo AP activo — sin WiFi. IP: <span id="vip">192.168.4.1</span> | Reintentar cada 3 min.
 </div>
 
-<div class="card">
-  <h3>Calidad del aire</h3>
-  <div class="row"><span class="lbl">🏭 AQI (1–5)</span><span id="vaqi" class="val">–</span></div>
-  <div class="row"><span class="lbl">💨 TVOC</span><span class="val" id="vtvoc">–</span></div>
-  <div class="row"><span class="lbl">☁️ eCO₂</span><span class="val" id="veco2">–</span></div>
-</div>
+<h3>Calidad del aire</h3>
+AQI: <span id="vaqi">–</span><br>
+TVOC: <span id="vtvoc">–</span><br>
+eCO2: <span id="veco2">–</span>
 
-<div class="card">
-  <h3>Ambiente</h3>
-  <div class="row"><span class="lbl">💦 Humedad</span><span class="val" id="vhum">–</span></div>
-  <div class="row"><span class="lbl">🌡️ Temperatura</span><span class="val" id="vtemp">–</span></div>
-</div>
+<h3>Ambiente</h3>
+Humedad: <span id="vhum">–</span><br>
+Temperatura: <span id="vtemp">–</span>
 
-<div class="card">
-  <h3>🪴 Humedad de suelo</h3>
-  <div class="row">
-    <span class="lbl">Suelo</span>
-    <div class="soil-bar-wrap"><div class="soil-bar" id="soil-bar" style="width:0%"></div></div>
-    <span class="val" id="vsoil">–</span>
-  </div>
-  <p class="note" style="margin-top:6px">Calibrar SOIL_DRY / SOIL_WET en el firmware según tu sensor.</p>
-</div>
+<h3>Humedad suelo</h3>
+<span id="vsoil">–</span>
+<div id="soil-bar" style="display:inline-block;height:8px;vertical-align:middle"></div>
 
-<div class="card">
-  <h3>Extractor &nbsp;<span id="mode-b" class="badge">–</span></h3>
-  <div class="row">
-    <span>Estado: <span id="ext-s">–</span></span>
-    <span id="timer-info" style="font-size:.82em;color:#888"></span>
-  </div>
-  <div style="margin-top:8px">
-    <button class="b-on"   onclick="cmd('/set?relay=ON')">▶ Encender</button>
-    <button class="b-off"  onclick="cmd('/set?relay=OFF')">■ Apagar</button>
-    <button class="b-auto" onclick="cmd('/set?mode=AUTO')">⟳ Auto</button>
-  </div>
-</div>
+<h3>Extractor — <span id="mode-b">–</span></h3>
+Estado: <span id="ext-s">–</span> <span id="timer-info"></span><br>
+<button onclick="cmd('/set?relay=ON')">Encender</button>
+<button onclick="cmd('/set?relay=OFF')">Apagar</button>
+<button onclick="cmd('/set?mode=AUTO')">Auto</button>
 
-<div class="card">
-  <h3>Umbrales <span style="font-weight:400;color:#aaa;font-size:.85em">(±5 % histéresis en humedad)</span></h3>
-  <div class="row">
-    <span class="lbl">AQI mín. (1–5)</span>
-    <span><input type="number" id="t1" min="1" max="5" step="1">
-          <button onclick="setV('t1')">✓</button></span>
-  </div>
-  <div class="row">
-    <span class="lbl">Humedad aire mín.</span>
-    <span><input type="number" id="t2" min="0" max="100">%
-          <button onclick="setV('t2')">✓</button></span>
-  </div>
-  <div class="row">
-    <span class="lbl">🪴 Humedad suelo mín.</span>
-    <span><input type="number" id="t3" min="0" max="100">%
-          <button onclick="setV('t3')">✓</button></span>
-  </div>
-</div>
+<h3>Umbrales (±5% histéresis)</h3>
+AQI (1–5): <input type="number" id="t1" min="1" max="5" step="1"> <button onclick="setV('t1')">✓</button><br>
+Humedad aire: <input type="number" id="t2" min="0" max="100">% <button onclick="setV('t2')">✓</button><br>
+Humedad suelo: <input type="number" id="t3" min="0" max="100">% <button onclick="setV('t3')">✓</button>
 
-<div class="card">
-  <h3>⏱ Temporizador</h3>
-  <p class="note">0 minutos = desactivado</p>
-  <div class="tbox">
-    <div class="row">
-      <span class="lbl">Máx. encendido</span>
-      <span><input type="number" id="ton" min="0" max="1440"> min
-            <button onclick="setV('ton')">✓</button></span>
-    </div>
-    <div class="row">
-      <span class="lbl">Cooldown (espera)</span>
-      <span><input type="number" id="tof" min="0" max="1440"> min
-            <button onclick="setV('tof')">✓</button></span>
-    </div>
-  </div>
-</div>
+<h3>Temporizador (0 = desactivado)</h3>
+Máx. encendido: <input type="number" id="ton" min="0" max="1440"> min <button onclick="setV('ton')">✓</button><br>
+Cooldown: <input type="number" id="tof" min="0" max="1440"> min <button onclick="setV('tof')">✓</button>
 
-<div class="card">
-  <h3>Logs</h3>
-  <p class="note"><a href="/log" target="_blank" style="font-size:.85em;color:#1565c0">📋 Ver log (desactivado por código para evitar demasiadas sobrescrituras en la flash)</a></p>
-</div>
+<h3>Logs &amp; Sistema</h3>
+<div id="crash-info" style="display:none"></div>
+Heap: <span id="vheap">–</span><br>
+<a href="/log" target="_blank">Ver log</a> |
+<button onclick="clearLog()">Borrar log</button>
 
-<div class="card">
-  <h3>🔧 Red WiFi</h3>
-  <div class="row">
-    <span class="lbl">IP actual</span>
-    <span id="vip-sta" class="val" style="font-size:1em">–</span>
-  </div>
-  <div style="margin-top:8px">
-    <button class="b-wifi" onclick="wifiPortal()">⚙️ Configurar WiFi</button>
-  </div>
-  <p class="note" style="margin-top:6px">
-    Abre el portal WiFiManager (AP: <strong>ExtractorAP</strong>).<br>
-    El dispositivo se reiniciará tras configurar o en 3 min.
-  </p>
+<h3>Red WiFi</h3>
+IP: <span id="vip-sta">–</span><br>
+<button onclick="toggleWifiForm()">Cambiar WiFi</button>
+<button onclick="wifiPortal()">Desconectar + AP</button>
+<div id="wifi-form" style="display:none">
+  SSID: <input type="text" id="wssid" placeholder="Nombre red"><br>
+  Pass: <input type="password" id="wpass" placeholder="Contraseña"><br>
+  <button onclick="submitWifiSta()">Aplicar y reiniciar</button>
+  <button onclick="toggleWifiForm()">Cancelar</button>
 </div>
 
 <script>
@@ -807,16 +877,47 @@ function refresh(){
     }
   }).catch(()=>{});
 }
+// Cargar info de crash y heap al inicio (solo una vez)
+function loadCrashInfo(){
+  fetch('/api/crash').then(r=>r.json()).then(d=>{
+    if(d.free_heap) document.getElementById('vheap').textContent=Math.round(d.free_heap/1024)+'KB';
+    var box=document.getElementById('crash-info');
+    if(d.prev_valid && d.prev_reason_n!==0 && d.prev_reason_n!==4 && d.prev_reason_n!==5){
+      box.style.display='block';
+      var isCrash=(d.prev_reason_n===1||d.prev_reason_n===2||d.prev_reason_n===3);
+      box.innerHTML=(isCrash?'⚠️ <strong>Crash detectado</strong>':'ℹ️ Reset previo')+
+        ' — motivo: <strong>'+d.prev_reason+'</strong>'+
+        (d.reset_count>0?' (×'+d.reset_count+')'  :'')+
+        (d.prev_last_msg?'<br>Último log: <em>'+d.prev_last_msg+'</em>':'');
+    }
+  }).catch(()=>{});
+}
 function cmd(u){fetch(u).then(refresh);}
 function setV(id){cmd('/set?'+id+'='+document.getElementById(id).value);}
+function clearLog(){if(confirm('¿Borrar el log de sistema?'))fetch('/log/clear');}
+function toggleWifiForm(){
+  var f=document.getElementById('wifi-form');
+  f.style.display=f.style.display==='none'?'block':'none';
+}
+function submitWifiSta(){
+  var s=document.getElementById('wssid').value.trim();
+  var p=document.getElementById('wpass').value;
+  if(!s){alert('Introduce el SSID.');return;}
+  if(confirm('¿Conectar a "'+s+'" y reiniciar el dispositivo?')){
+    fetch('/wifi/sta?ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p))
+      .then(()=>alert('Reiniciando… Reconéctate a la misma red en unos segundos.'))
+      .catch(()=>alert('Reiniciando…'));
+  }
+}
 function wifiPortal(){
-  if(confirm('¿Abrir portal de configuración WiFi?\n\nEl dispositivo activará el AP "ExtractorAP" y se reiniciará al terminar.')){
+  if(confirm('¿Desconectar del WiFi y abrir portal de configuración?\n\nSe creará el AP "ExtractorAP". El dispositivo se reiniciará al terminar (o en 3 min).')){
     fetch('/wifi').then(()=>{
       alert('Portal iniciado.\nConéctate al AP "ExtractorAP" y abre 192.168.4.1');
     });
   }
 }
 refresh(); setInterval(refresh,8000);
+loadCrashInfo();
 </script></body></html>
 )html";
 
@@ -901,27 +1002,91 @@ void handleSet()
 }
 
 /* ══════════════════════════════════════════════════════════
+   Web – configurar WiFi STA desde la conexión actual (/wifi/sta)
+   No lanza AP: guarda las credenciales y reinicia.
+   ══════════════════════════════════════════════════════════ */
+void handleWifiSta()
+{
+    if (!webServer.hasArg("ssid") || webServer.arg("ssid").length() == 0)
+    {
+        webServer.send(400, "text/plain", "ssid requerido");
+        return;
+    }
+    String ssid = webServer.arg("ssid");
+    String pass = webServer.arg("pass");
+
+    webServer.send(200, "text/html",
+                   F("<!DOCTYPE html><html><head>"
+                     "<meta charset=UTF-8>"
+                     "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                     "<title>WiFi – Extractor</title>"
+                     "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:16px}"
+                     "h2{color:#1565c0}</style></head><body>"
+                     "<h2>🔄 Aplicando nueva red WiFi...</h2>"
+                     "<p>El dispositivo se reiniciará en 2 segundos e intentará conectarse a la red indicada.</p>"
+                     "<p>Si la conexión falla, volverá a modo AP automáticamente.</p>"
+                     "</body></html>"));
+
+    delay(500);
+    // Guardar credenciales en flash de forma persistente (una sola vez)
+    WiFi.persistent(true);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    WiFi.persistent(false);
+    delay(300);
+    ESP.restart();
+}
+
+/* ══════════════════════════════════════════════════════════
+   Web – info de crash (/api/crash)
+   ══════════════════════════════════════════════════════════ */
+void handleCrashApi()
+{
+    JsonDocument doc;
+    struct rst_info *ri = ESP.getResetInfoPtr();
+    doc["current_reason"] = ri ? rstReasonStr(ri->reason) : "?";
+    doc["current_reason_n"] = ri ? (int)ri->reason : -1;
+    doc["free_heap"] = (int)ESP.getFreeHeap();
+    doc["chip_id"] = String(ESP.getChipId(), HEX);
+    if (gCrashInfoValid)
+    {
+        doc["prev_valid"] = true;
+        doc["prev_reason"] = rstReasonStr(gCrashInfo.reason);
+        doc["prev_reason_n"] = (int)gCrashInfo.reason;
+        doc["prev_exccause"] = (int)gCrashInfo.exccause;
+        doc["prev_last_msg"] = gCrashInfo.lastMsg;
+        doc["reset_count"] = (int)gCrashInfo.resetCount;
+    }
+    else
+    {
+        doc["prev_valid"] = false;
+    }
+    String out;
+    serializeJson(doc, out);
+    webServer.send(200, "application/json", out);
+}
+
+/* ══════════════════════════════════════════════════════════
    Web – portal WiFiManager (endpoint /wifi)
    ══════════════════════════════════════════════════════════ */
 void handleWifiPortal()
 {
     // Enviar respuesta antes de activar el flag
     webServer.send(200, "text/html",
-        F("<!DOCTYPE html><html><head>"
-          "<meta charset=UTF-8>"
-          "<meta name=viewport content='width=device-width,initial-scale=1'>"
-          "<title>WiFi – Extractor</title>"
-          "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:16px}"
-          "h2{color:#6a1b9a}p{line-height:1.6}strong{color:#333}</style>"
-          "</head><body>"
-          "<h2>⚙️ Portal WiFi iniciando...</h2>"
-          "<p>En unos segundos se activará el AP <strong>ExtractorAP</strong>.</p>"
-          "<p>Conéctate a ese AP (contraseña: la configurada) y navega a "
-          "<strong>192.168.4.1</strong> para configurar el WiFi.</p>"
-          "<p>El portal expira en <strong>3 minutos</strong>; "
-          "el dispositivo se reiniciará automáticamente.</p>"
-          "<p><small>Si no aparece el portal, navega manualmente a 192.168.4.1</small></p>"
-          "</body></html>"));
+                   F("<!DOCTYPE html><html><head>"
+                     "<meta charset=UTF-8>"
+                     "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                     "<title>WiFi – Extractor</title>"
+                     "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:16px}"
+                     "h2{color:#6a1b9a}p{line-height:1.6}strong{color:#333}</style>"
+                     "</head><body>"
+                     "<h2>⚙️ Portal WiFi iniciando...</h2>"
+                     "<p>En unos segundos se activará el AP <strong>ExtractorAP</strong>.</p>"
+                     "<p>Conéctate a ese AP (contraseña: la configurada) y navega a "
+                     "<strong>192.168.4.1</strong> para configurar el WiFi.</p>"
+                     "<p>El portal expira en <strong>3 minutos</strong>; "
+                     "el dispositivo se reiniciará automáticamente.</p>"
+                     "<p><small>Si no aparece el portal, navega manualmente a 192.168.4.1</small></p>"
+                     "</body></html>"));
     gPortalRequested = true;
 }
 
@@ -941,63 +1106,652 @@ void setupOTA()
 
     ArduinoOTA.setHostname("extractor-esp");
     ArduinoOTA.onStart([]()
-    {
-        // Radio siempre activa (ya está en WIFI_NONE_SLEEP permanente)
-        LOG_PRINTLN(F("OTA: inicio"));
-    });
+                       { LOG_PRINTLN(F("OTA: inicio")); });
     ArduinoOTA.onEnd([]()
-    {
-        LOG_PRINTLN(F("\nOTA: fin"));
-    });
+                     { LOG_PRINTLN(F("\nOTA: fin")); });
     ArduinoOTA.onError([](ota_error_t e)
-    {
-        LOG_PRINTF_P(PSTR("OTA error [%u]\n"), e);
-    });
+                       { LOG_PRINTF_P(PSTR("OTA error [%u]\n"), e); });
     ArduinoOTA.begin();
     LOG_PRINTLN(F("OTA listo → 'extractor-esp'."));
 }
 
+void handleLog()
+{
+    // Si quieres ver algo en /log aunque la flash esté apagada:
+    String s = "<!DOCTYPE html><html><head><meta charset=UTF-8><title>Log</title>";
+    s += "<style>body{background:#111;color:#cfc;font-family:monospace;padding:20px}</style></head><body>";
+    s += "<h3>Estado de Memoria Flash: <span style='color:orange'>DESACTIVADA</span></h3>";
+    s += "<p>Los logs en tiempo real se ven por Serial o Telnet.</p>";
 
-void handleLog() {
-    File f = LittleFS.open("/log.txt", "r");
-    if (!f) {
-        webServer.send(200, "text/html",
-            "<pre>Log vacío.</pre>");
-        return;
+    if (gCrashInfoValid)
+    {
+        s += "<hr><h4>ÚLTIMO RASTRO EN RTC (Caja Negra):</h4>";
+        s += "<b>Motivo:</b> " + String(rstReasonStr(gCrashInfo.reason)) + "<br>";
+        s += "<b>Contador de Resets:</b> " + String(gCrashInfo.resetCount) + "<br>";
+        s += "<b>Último mensaje antes de reset:</b> <i style='color:#7bf'>" + String(gCrashInfo.lastMsg) + "</i>";
     }
-    // Cabecera HTML con auto-scroll y refresco
-    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    webServer.send(200, "text/html", "");
-    webServer.sendContent(
-        "<!DOCTYPE html><html><head>"
-        "<meta charset=UTF-8>"
-        "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>Log – Extractor</title>"
-        "<style>body{background:#111;color:#cfc;font-family:monospace;font-size:.82em;"
-        "padding:10px}pre{white-space:pre-wrap;word-break:break-all}"
-        "a{color:#7bf;text-decoration:none;margin-right:12px}</style></head><body>"
-        "<p><a href='/'>← Inicio</a>"
-        "<a href='/log'>↺ Refrescar</a>"
-        "<a href='/log/clear'>🗑 Borrar</a></p><pre>"
-    );
-    // Stream del fichero en chunks — 0 heap extra
-    uint8_t chunk[256];
-    while (f.available()) {
-        size_t n = f.read(chunk, sizeof(chunk));
-        webServer.sendContent(reinterpret_cast<char*>(chunk), n);
-    }
-    f.close();
-    webServer.sendContent("</pre><script>window.scrollTo(0,document.body.scrollHeight)</script>"
-                          "</body></html>");
-    webServer.sendContent("");
+
+    s += "<br><br><a href='/' style='color:#fff'>[ Volver al Inicio ]</a></body></html>";
+    webServer.send(200, "text/html", s);
 }
 
-void handleLogClear() {
+void handleLogClear()
+{
     LittleFS.remove("/log.txt");
     webServer.sendHeader("Location", "/log");
     webServer.send(303);
 }
 
+/* ══════════════════════════════════════════════════════════
+   WiFi Test – persistencia en flash
+   ══════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════
+   WiFi Test – persistencia en flash
+   saveWifiTestCheckpoint() → guarda progreso parcial tras cada paso.
+   saveWifiTestResults()    → alias final (marca done=true).
+   ══════════════════════════════════════════════════════════ */
+
+/**
+ * Guarda en /wifitest.json el estado actual del test:
+ * - Si el test está en curso  → running=true, los pasos ya completos y errores.
+ * - Si el test ha terminado   → running=false/done=true, todos los resultados.
+ * Se llama después de cada paso y al finalizar, para no perder nada ante un reinicio.
+ */
+void saveWifiTestCheckpoint()
+{
+    if (!littleFSok)
+        return;
+    File f = LittleFS.open("/wifitest.json", "w");
+    if (!f)
+    {
+        LOG_PRINTLN(F("[WTest] ERROR: no se pudo abrir /wifitest.json para escritura."));
+        return;
+    }
+    JsonDocument doc;
+    doc["ts"] = gWtTimestamp;
+    doc["running"] = gWtRunning; // true si el test aún no ha terminado
+    doc["done"] = gWtDone;
+    doc["step"] = gWtStep; // último paso completado
+
+    JsonArray arr = doc["results"].to<JsonArray>();
+    // Guardar solo los pasos ya terminados (índices 0..gWtStep-1 si en curso, todos si done)
+    int limit = gWtDone ? WTEST_TOTAL : gWtStep;
+    for (int i = 0; i < limit; i++)
+    {
+        JsonObject o = arr.add<JsonObject>();
+        o["mode"] = gWtResults[i].phyMode;
+        o["power"] = gWtResults[i].power;
+        o["ok"] = gWtResults[i].connected;
+        o["rssi"] = gWtResults[i].rssi;
+        o["cMs"] = gWtResults[i].connectMs;
+        o["bps"] = gWtResults[i].downloadBps;
+        o["err"] = gWtResults[i].errCode;
+    }
+    serializeJson(doc, f);
+    f.close();
+    LOG_PRINTF_P(PSTR("[WTest] Checkpoint guardado: paso %d/%d, done=%d\n"),
+                 gWtStep, WTEST_TOTAL, (int)gWtDone);
+}
+
+void saveWifiTestResults()
+{
+    // Alias semántico para el guardado final: asegura que done=true está reflejado.
+    saveWifiTestCheckpoint();
+}
+
+bool loadWifiTestResults()
+{
+    if (!littleFSok)
+        return false;
+    File f = LittleFS.open("/wifitest.json", "r");
+    if (!f)
+        return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, f) != DeserializationError::Ok)
+    {
+        f.close();
+        return false;
+    }
+    f.close();
+    gWtTimestamp = doc["ts"] | "";
+
+    // Si el JSON dice que el test estaba en curso → fue abortado por reinicio/crash.
+    // Marcamos los pasos no completados con WTEST_ERR_ABORTED.
+    bool wasRunning = doc["running"] | false;
+    int savedStep = doc["step"] | 0;
+
+    JsonArray arr = doc["results"].as<JsonArray>();
+    int i = 0;
+    for (JsonObject o : arr)
+    {
+        if (i >= WTEST_TOTAL)
+            break;
+        gWtResults[i].phyMode = o["mode"] | 0;
+        gWtResults[i].power = o["power"] | 0.0f;
+        gWtResults[i].connected = o["ok"] | false;
+        gWtResults[i].rssi = o["rssi"] | 0;
+        gWtResults[i].connectMs = o["cMs"] | 0;
+        gWtResults[i].downloadBps = o["bps"] | (int)-1;
+        gWtResults[i].errCode = o["err"] | (int)WTEST_ERR_OK;
+        i++;
+    }
+
+    if (wasRunning)
+    {
+        // El test se interrumpió: rellenar los pasos pendientes con ABORTED
+        for (int j = i; j < WTEST_TOTAL; j++)
+        {
+            gWtResults[j].phyMode = kWtModes[j / WTEST_N_POWERS];
+            gWtResults[j].power = kWtPowers[j % WTEST_N_POWERS];
+            gWtResults[j].connected = false;
+            gWtResults[j].rssi = 0;
+            gWtResults[j].connectMs = 0;
+            gWtResults[j].downloadBps = -1;
+            gWtResults[j].errCode = WTEST_ERR_ABORTED;
+        }
+        gWtDone = true; // mostrar como finalizado (con errores de aborto)
+        LOG_PRINTF_P(PSTR("[WTest] Test anterior abortado en paso %d — pasos pendientes marcados.\n"),
+                     savedStep);
+        // Persistir el estado corregido para que la web lo muestre correctamente
+        gWtTimestamp += " [abortado]";
+        saveWifiTestCheckpoint();
+        return true;
+    }
+
+    gWtDone = (i == WTEST_TOTAL) && (doc["done"] | false);
+    return gWtDone;
+}
+
+/* ══════════════════════════════════════════════════════════
+   WiFi Test – test de velocidad (bloqueante ~5 s, usa yield)
+   Descarga de un servidor HTTP conocido y mide throughput.
+   ══════════════════════════════════════════════════════════ */
+int32_t doWifiSpeedTest()
+{
+    // Servidor HTTP plano (sin TLS) con ficheros de tamaño fijo para tests
+    const char *host = "speedtest.tele2.net";
+    const uint16_t port = 80;
+    const char *path = "/100KB.zip"; // 102400 bytes controlados
+    // const char* path = "sha1sum.txt";
+    WiFiClient client;
+    client.setTimeout(6000);
+
+    unsigned long tConn = millis();
+    if (!client.connect(host, port))
+    {
+        LOG_PRINTLN(F("[WTest] Speed: no pudo conectar al servidor."));
+        return -1;
+    }
+    LOG_PRINTF_P(PSTR("[WTest] Speed: conectado en %lu ms\n"), millis() - tConn);
+
+    // Petición HTTP/1.0 (sin chunked transfer)
+    client.print(F("GET "));
+    client.print(path);
+    client.print(F(" HTTP/1.0\r\nHost: "));
+    client.print(host);
+    client.print(F("\r\nConnection: close\r\n\r\n"));
+
+    // Saltar cabeceras HTTP
+    unsigned long tHdr = millis();
+    bool headersDone = false;
+    while (client.connected() && millis() - tHdr < 4000UL)
+    {
+        String line = client.readStringUntil('\n');
+        yield();
+        if (line == "\r" || line == "")
+        {
+            headersDone = true;
+            break;
+        }
+    }
+    if (!headersDone)
+    {
+        client.stop();
+        return -1;
+    }
+
+    // Contar bytes descargados durante hasta 5 segundos
+    uint32_t totalBytes = 0;
+    uint8_t buf[256];
+    unsigned long tStart = millis();
+    while (client.connected() && millis() - tStart < 5000UL)
+    {
+        int avail = client.available();
+        if (avail > 0)
+        {
+            int n = client.read(buf, min((int)sizeof(buf), avail));
+            if (n > 0)
+                totalBytes += (uint32_t)n;
+        }
+        else
+        {
+            delay(2);
+        }
+        yield();
+    }
+    client.stop();
+
+    uint32_t elapsed = millis() - tStart;
+    if (elapsed == 0 || totalBytes == 0)
+        return -1;
+
+    // bytes/s
+    int32_t bps = (int32_t)((uint64_t)totalBytes * 1000UL / elapsed);
+    LOG_PRINTF_P(PSTR("[WTest] Speed: %lu bytes en %lu ms → %ld B/s\n"),
+                 totalBytes, elapsed, bps);
+    return bps;
+}
+
+/* ══════════════════════════════════════════════════════════
+   WiFi Test – state machine, llamar desde loop()
+   ══════════════════════════════════════════════════════════ */
+
+// Helper interno: finalizar el test de forma ordenada (éxito o forzado).
+// Restaura WiFi, guarda resultados y limpia el estado.
+static void wtFinalize(bool abortedByTimeout)
+{
+    LOG_PRINTF_P(PSTR("[WTest] Finalizando test (abortado=%d). Restaurando WiFi...\n"),
+                 (int)abortedByTimeout);
+
+    // Si se abortó por timeout global, marcar los pasos no completados
+    if (abortedByTimeout)
+    {
+        for (int j = gWtStep; j < WTEST_TOTAL; j++)
+        {
+            gWtResults[j].phyMode = kWtModes[j / WTEST_N_POWERS];
+            gWtResults[j].power = kWtPowers[j % WTEST_N_POWERS];
+            gWtResults[j].connected = false;
+            gWtResults[j].rssi = 0;
+            gWtResults[j].connectMs = 0;
+            gWtResults[j].downloadBps = -1;
+            gWtResults[j].errCode = WTEST_ERR_GLOBAL_TMO;
+        }
+    }
+
+    // Timestamp del fin
+    if (timeOK && getLocalTime(&timeinfo))
+    {
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        gWtTimestamp = String(buf);
+        if (abortedByTimeout)
+            gWtTimestamp += " [timeout]";
+    }
+    else
+    {
+        gWtTimestamp = "t+" + String(millis() / 1000) + "s";
+        if (abortedByTimeout)
+            gWtTimestamp += " [timeout]";
+    }
+
+    gWtRunning = false;
+    gWtDone = true;
+    gWtPhase = WTP_IDLE;
+
+    saveWifiTestResults(); // guardado final
+    LOG_PRINTLN(F("[WTest] Test WiFi finalizado y guardado."));
+}
+
+void runWifiTestStep()
+{
+    if (!gWtRunning)
+        return;
+
+    // ── Timeout global: si el test lleva demasiado tiempo, abortarlo ──
+    if (millis() - gWtStartTime > WTEST_GLOBAL_TIMEOUT_MS)
+    {
+        LOG_PRINTF_P(PSTR("[WTest] TIMEOUT GLOBAL (%lu ms) — abortando test.\n"),
+                     millis() - gWtStartTime);
+        // Restaurar WiFi antes de finalizar
+        WiFi.disconnect(false);
+        delay(200);
+        yield();
+        WiFi.setOutputPower(gWtOrigPower);
+        WiFi.setPhyMode((WiFiPhyMode_t)gWtOrigPhyMode);
+        WiFi.begin();
+        wtFinalize(true);
+        return;
+    }
+
+    int modeIdx = gWtStep / WTEST_N_POWERS;
+    int powerIdx = gWtStep % WTEST_N_POWERS;
+
+    switch (gWtPhase)
+    {
+    case WTP_START_DELAY:
+        // Dar ~2 s para que la respuesta HTTP de /testwifi/run llegue al navegador
+        // antes de cortar el WiFi con disconnect(). Sin esto el fetch() falla.
+        if (millis() - gWtPhaseTimer >= 2000UL)
+        {
+            LOG_PRINTLN(F("[WTest] Iniciando primera combinación..."));
+            gWtPhase = WTP_CONNECT;
+        }
+        break;
+
+    case WTP_CONNECT:
+    {
+        WiFiPhyMode_t mode = kWtModes[modeIdx];
+        float pwr = kWtPowers[powerIdx];
+
+        static const char *modeNames[] = {"11b", "11g", "11n"};
+        LOG_PRINTF_P(PSTR("[WTest] Paso %d/%d: modo=%s pow=%.1f dBm\n"),
+                     gWtStep + 1, WTEST_TOTAL, modeNames[modeIdx], pwr);
+
+        gWtResults[gWtStep].phyMode = (uint8_t)mode;
+        gWtResults[gWtStep].power = pwr;
+        gWtResults[gWtStep].errCode = WTEST_ERR_OK; // se sobreescribirá si hay error
+
+        WiFi.setOutputPower(pwr);
+        WiFi.setPhyMode(mode);
+        WiFi.disconnect(false);
+        delay(300);
+        yield();
+        WiFi.begin(); // credenciales guardadas por WiFiManager
+
+        gWtPhaseTimer = millis();
+        gWtPhase = WTP_WAITING;
+        break;
+    }
+
+    case WTP_WAITING:
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            uint16_t elapsed = (uint16_t)min((unsigned long)65535UL, millis() - gWtPhaseTimer);
+            gWtResults[gWtStep].connected = true;
+            gWtResults[gWtStep].connectMs = elapsed;
+            gWtResults[gWtStep].rssi = (int8_t)WiFi.RSSI();
+            gWtResults[gWtStep].errCode = WTEST_ERR_OK;
+            LOG_PRINTF_P(PSTR("[WTest] Conectado en %u ms, RSSI=%d dBm\n"),
+                         elapsed, WiFi.RSSI());
+            gWtPhase = WTP_SPEED;
+        }
+        else if (millis() - gWtPhaseTimer > 15000UL)
+        {
+            LOG_PRINTF_P(PSTR("[WTest] Timeout en paso %d → sin conexión.\n"), gWtStep + 1);
+            gWtResults[gWtStep].connected = false;
+            gWtResults[gWtStep].rssi = 0;
+            gWtResults[gWtStep].connectMs = 0;
+            gWtResults[gWtStep].downloadBps = -1;
+            gWtResults[gWtStep].errCode = WTEST_ERR_TIMEOUT;
+            gWtPhase = WTP_DONE_STEP;
+        }
+        break;
+
+    case WTP_SPEED:
+    {
+        int32_t bps = doWifiSpeedTest();
+        gWtResults[gWtStep].downloadBps = bps;
+        if (bps < 0)
+        {
+            LOG_PRINTF_P(PSTR("[WTest] Speed test fallido en paso %d.\n"), gWtStep + 1);
+            gWtResults[gWtStep].errCode = WTEST_ERR_SPEED;
+        }
+        gWtPhase = WTP_DONE_STEP;
+        break;
+    }
+
+    case WTP_DONE_STEP:
+        // ── Guardar en flash el resultado de este paso ─────────────
+        gWtStep++;
+        saveWifiTestCheckpoint(); // persiste progreso ANTES de pasar al siguiente
+
+        if (gWtStep >= WTEST_TOTAL)
+        {
+            /* ── Test completado: iniciar restauración no-bloqueante ── */
+            LOG_PRINTLN(F("[WTest] Todas las combinaciones probadas. Restaurando WiFi..."));
+            WiFi.disconnect(false);
+            delay(300);
+            yield();
+            WiFi.setOutputPower(gWtOrigPower);
+            WiFi.setPhyMode((WiFiPhyMode_t)gWtOrigPhyMode);
+            WiFi.begin();
+
+            gWtPhaseTimer = millis();
+            gWtPhase = WTP_RESTORE_WAIT;
+        }
+        else
+        {
+            gWtPhase = WTP_CONNECT;
+            delay(800); // pausa breve entre combinaciones
+            yield();
+        }
+        break;
+
+    case WTP_RESTORE_WAIT:
+    {
+        // Esperar reconexión final de forma NO bloqueante (max 20 s)
+        bool connected = (WiFi.status() == WL_CONNECTED);
+        bool timedOut = (millis() - gWtPhaseTimer > 20000UL);
+
+        if (connected)
+        {
+            LOG_PRINTF_P(PSTR("[WTest] WiFi restaurado: %s\n"),
+                         WiFi.localIP().toString().c_str());
+            wtFinalize(false);
+        }
+        else if (timedOut)
+        {
+            LOG_PRINTLN(F("[WTest] Aviso: WiFi no reconectó tras restaurar (timeout 20 s)."));
+            wtFinalize(false); // el test en sí terminó OK; solo la reconexión tardó
+        }
+        // Si ninguno de los dos: esperar al siguiente tick del loop
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/* ══════════════════════════════════════════════════════════
+   Web – handlers /testwifi
+   ══════════════════════════════════════════════════════════ */
+
+// Página HTML principal del test WiFi
+const char HTML_TESTWIFI[] PROGMEM = R"html(
+<!DOCTYPE html><html lang="es"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Test WiFi – Extractor</title>
+<style>
+body{font-family:sans-serif;max-width:720px;margin:24px auto;padding:16px;background:#fafafa;color:#222}
+h2{color:#1565c0;margin-bottom:4px}
+.sub{color:#555;font-size:13px;margin-bottom:16px}
+.btn{display:inline-block;padding:10px 22px;margin:6px 4px;border:none;border-radius:6px;
+     cursor:pointer;font-size:14px;text-decoration:none}
+.bp{background:#1565c0;color:#fff}.bs{background:#546e7a;color:#fff}
+.btn:disabled,.btn[disabled]{opacity:.45;cursor:not-allowed}
+#progress{display:none;margin:16px 0;padding:14px 16px;background:#e3f2fd;
+          border-radius:8px;border-left:4px solid #1565c0}
+.bar-bg{background:#bbdefb;border-radius:4px;height:10px;margin:8px 0}
+.bar-fg{background:#1565c0;height:10px;border-radius:4px;transition:width .6s}
+#prog-label{font-weight:bold;font-size:14px}
+#status-msg{color:#555;font-size:12px;margin-top:4px}
+#results{margin-top:20px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #ccc;padding:7px 10px;text-align:center}
+th{background:#1565c0;color:#fff;font-size:12px}
+tr:nth-child(even){background:#f5f5f5}
+.ok{color:#2e7d32;font-weight:bold}.fail{color:#c62828;font-weight:bold}
+.best{background:#e8f5e9 !important}
+.warn{color:#e65100}
+</style></head><body>
+<h2>🔬 Test WiFi por Modo &amp; Potencia</h2>
+<p class="sub">Prueba la conexión con los datos WiFi almacenados por WifiManager<br>
+en <b>3 modos</b> (802.11b / g / n) × <b>diferentes potencias</b>.<br>
+⚠️ El test interrumpe WiFi/MQTT durante ~3 minutos. No tocar el dispositivo mientras corre.</p>
+
+<button class="btn bp" id="btn-run" onclick="startTest()">▶ Realizar Test</button>
+<button class="btn bs" id="btn-view" onclick="loadResults()">📊 Ver Últimos Resultados</button>
+<a href="/" class="btn bs">← Inicio</a>
+
+<div id="progress">
+  <div id="prog-label">Preparando...</div>
+  <div class="bar-bg"><div class="bar-fg" id="prog-bar" style="width:0%"></div></div>
+  <div id="status-msg"></div>
+</div>
+<div id="results"></div>
+
+<script>
+var polling=null;
+var modeNames={1:'802.11b',2:'802.11g',3:'802.11n'};
+var powers=[5.0, 10.0, 15.0, 17.5, 18.5, 19.5, 20.5];
+var errLabels={0:'',1:'timeout',2:'speed fail',3:'global timeout',4:'abortado'};
+
+function startTest(){
+  document.getElementById('btn-run').disabled=true;
+  document.getElementById('btn-view').disabled=true;
+  document.getElementById('progress').style.display='block';
+  document.getElementById('prog-label').textContent='Iniciando...';
+  document.getElementById('results').innerHTML='';
+  fetch('/testwifi/run').then(function(){
+    polling=setInterval(pollStatus,2500);
+    pollStatus();
+  }).catch(function(e){
+    document.getElementById('prog-label').textContent='Error al iniciar: '+e;
+    document.getElementById('btn-run').disabled=false;
+    document.getElementById('btn-view').disabled=false;
+  });
+}
+
+function loadResults(){
+  fetch('/testwifi/status').then(function(r){return r.json();}).then(function(d){
+    if(!d.results||d.results.length===0){
+      document.getElementById('results').innerHTML='<p>Sin resultados guardados aún.</p>';
+    }else{
+      showResults(d);
+    }
+  }).catch(function(){
+    document.getElementById('results').innerHTML='<p>Error al obtener resultados.</p>';
+  });
+}
+
+function pollStatus(){
+  fetch('/testwifi/status').then(function(r){return r.json();}).then(function(d){
+    var pct=d.total>0?Math.round(100*d.step/d.total):0;
+    document.getElementById('prog-bar').style.width=pct+'%';
+    if(d.running){
+      var mi=Math.floor(d.step/7); var pi=d.step%7;
+      document.getElementById('prog-label').textContent=
+        'Probando '+( d.step+1)+'/'+d.total+': '+
+        (mi<3?modeNames[mi+1]:'?')+' @ '+(pi<7?powers[pi]:'?')+' dBm…';
+      document.getElementById('status-msg').textContent='Puede tardar ~6 min en total. No recargar.';
+    }else{
+      clearInterval(polling); polling=null;
+      document.getElementById('prog-bar').style.width='100%';
+      document.getElementById('prog-label').textContent='✅ Test completado';
+      document.getElementById('status-msg').textContent='';
+      document.getElementById('btn-run').disabled=false;
+      document.getElementById('btn-view').disabled=false;
+      showResults(d);
+    }
+  }).catch(function(){});
+}
+
+function fmtSpeed(bps){
+  if(bps<0) return '—';
+  if(bps>=1048576) return (bps/1048576).toFixed(2)+' MB/s';
+  if(bps>=1024)    return (bps/1024).toFixed(1)+' KB/s';
+  return bps+' B/s';
+}
+
+function showResults(d){
+  if(!d.results||d.results.length===0){
+    document.getElementById('results').innerHTML='<p>Sin resultados.</p>';
+    return;
+  }
+  // Encontrar la mejor combinación (mayor bps entre las conectadas)
+  var bestBps=-1,bestIdx=-1;
+  for(var i=0;i<d.results.length;i++){
+    var r=d.results[i];
+    if(r.ok&&r.bps>bestBps){bestBps=r.bps;bestIdx=i;}
+  }
+  var html='<h3>Resultados'+(d.ts?' &mdash; <small style="font-weight:normal">'+d.ts+'</small>':'')+' </h3>';
+  html+='<table><tr><th>Modo</th><th>Potencia</th><th>Estado</th>';
+  html+='<th>T. conexión</th><th>RSSI</th><th>Velocidad</th><th>Error</th></tr>';
+  for(var i=0;i<d.results.length;i++){
+    var r=d.results[i];
+    var cls=i===bestIdx?' class="best"':'';
+    var okS=r.ok?'<span class="ok">✓ OK</span>':'<span class="fail">✗ Fallo</span>';
+    var ct=r.cMs?r.cMs+' ms':'—';
+    var rssi=r.rssi?r.rssi+' dBm':'—';
+    var spd=fmtSpeed(r.bps)+(i===bestIdx?' 🏆':'');
+    var errS=(r.err&&r.err>0)?'<span class="warn">'+( errLabels[r.err]||'err'+r.err)+'</span>':'';
+    html+='<tr'+cls+'><td>'+(modeNames[r.mode]||r.mode)+'</td><td>'+r.power.toFixed(1)+' dBm</td>';
+    html+='<td>'+okS+'</td><td>'+ct+'</td><td>'+rssi+'</td><td>'+spd+'</td><td>'+errS+'</td></tr>';
+  }
+  html+='</table>';
+  if(bestIdx>=0){
+    var b=d.results[bestIdx];
+    html+='<p>🏆 <b>Mejor combinación:</b> '+(modeNames[b.mode]||b.mode)+' @ '+
+          b.power.toFixed(1)+' dBm → '+fmtSpeed(b.bps)+'</p>';
+  }
+  document.getElementById('results').innerHTML=html;
+}
+</script></body></html>
+)html";
+
+void handleTestWifi()
+{
+    webServer.send_P(200, "text/html", HTML_TESTWIFI);
+}
+
+void handleTestWifiRun()
+{
+    if (gApMode)
+    {
+        webServer.send(400, "text/plain", "Test no disponible en modo AP (sin WiFi).");
+        return;
+    }
+    if (gWtRunning)
+    {
+        webServer.send(200, "application/json", "{\"started\":false,\"reason\":\"ya en curso\"}");
+        return;
+    }
+
+    // Reiniciar estado
+    gWtStep = 0;
+    gWtRunning = true;
+    gWtDone = false;
+    gWtPhase = WTP_START_DELAY; // esperar a que la respuesta HTTP llegue al navegador
+    gWtPhaseTimer = millis();
+    gWtStartTime = millis(); // arrancar el cronómetro del timeout global
+    gWtTimestamp = "";
+    memset(gWtResults, 0, sizeof(gWtResults));
+    for (int i = 0; i < WTEST_TOTAL; i++)
+        gWtResults[i].downloadBps = -1;
+
+    LOG_PRINTLN(F("[WTest] Test WiFi iniciado desde web."));
+    webServer.send(200, "application/json", "{\"started\":true}");
+}
+
+void handleTestWifiStatus()
+{
+    JsonDocument doc;
+    doc["running"] = gWtRunning;
+    doc["done"] = gWtDone;
+    doc["step"] = gWtStep;
+    doc["total"] = WTEST_TOTAL;
+    doc["ts"] = gWtTimestamp;
+
+    JsonArray arr = doc["results"].to<JsonArray>();
+    // Devolver solo los pasos ya completados (o todos si done)
+    int limit = gWtDone ? WTEST_TOTAL : gWtStep;
+    for (int i = 0; i < limit; i++)
+    {
+        JsonObject o = arr.add<JsonObject>();
+        o["mode"] = gWtResults[i].phyMode;
+        o["power"] = gWtResults[i].power;
+        o["ok"] = gWtResults[i].connected;
+        o["rssi"] = gWtResults[i].rssi;
+        o["cMs"] = gWtResults[i].connectMs;
+        o["bps"] = gWtResults[i].downloadBps;
+        o["err"] = gWtResults[i].errCode;
+    }
+
+    String out;
+    serializeJson(doc, out);
+    webServer.send(200, "application/json", out);
+}
 
 /* ══════════════════════════════════════════════════════════
    Setup
@@ -1006,17 +1760,60 @@ void handleLogClear() {
 void setup()
 {
     Serial.begin(115200);
+
+    /* ── Leer RTC crash info PRIMERO: antes de cualquier logLine()     ──
+     * Si lo hacemos después, updateRTCLastMsg() ya habrá sobreescrito
+     * el último mensaje del crash anterior y lo perderíamos para siempre. */
+    loadRTCCrash();
+
+    // Nota: LOG_PRINTLN ya incluirá el timestamp automáticamente
     LOG_PRINTLN(F("\n=== Extractor ESP8266 ==="));
 
     if (!LittleFS.begin())
     {
-        LOG_PRINTLN(F("ERROR: LittleFS no montado"));
+        Serial.println(F("ERROR: LittleFS no montado"));
         littleFSok = false;
     }
     else
     {
-        LOG_PRINTLN(F("LittleFS OK."));
+        Serial.println(F("LittleFS OK."));
         littleFSok = true;
+    }
+
+    /* ── RTC crash info ya cargado; procesar estado del reset actual: ── */
+    {
+        struct rst_info *ri = ESP.getResetInfoPtr();
+        uint32_t reason = ri ? ri->reason : 99;
+
+        // Formatear info de arranque para RTC
+        char bootHdr[100];
+        snprintf(bootHdr, sizeof(bootHdr), "BOOT: %s(%u)", rstReasonStr(reason), reason);
+
+        // ¿Fue un crash inesperado?
+        bool isCrash = (reason == 1 || reason == 2 || reason == 3);
+        if (isCrash)
+        {
+            gCrashInfo.magic = RTC_MAGIC;
+            gCrashInfo.reason = reason;
+            gCrashInfo.exccause = ri ? ri->exccause : 0;
+            gCrashInfo.resetCount = gCrashInfoValid ? gCrashInfo.resetCount + 1 : 1;
+            gCrashInfo.crc = rtcCrc(gCrashInfo);
+            ESP.rtcUserMemoryWrite(0, (uint32_t *)&gCrashInfo, sizeof(gCrashInfo));
+            gCrashInfoValid = true;
+
+            LOG_PRINTF_P(PSTR("*** CRASH #%u detectado! Motivo: %s\n"),
+                         gCrashInfo.resetCount, rstReasonStr(gCrashInfo.reason));
+        }
+        else
+        {
+            gCrashInfo.magic = RTC_MAGIC;
+            gCrashInfo.reason = reason;
+            gCrashInfo.exccause = 0;
+            gCrashInfo.resetCount = 0;
+            // No borramos lastMsg aquí para poder verlo en la web tras un reinicio limpio
+            gCrashInfo.crc = rtcCrc(gCrashInfo);
+            ESP.rtcUserMemoryWrite(0, (uint32_t *)&gCrashInfo, sizeof(gCrashInfo));
+        }
     }
 
     pinMode(PIN_SOIL_VCC, OUTPUT);
@@ -1038,13 +1835,14 @@ void setup()
     Wire.setClock(100000); // bajar a 100 kHz — el ENS160 es sensible a velocidades altas
 
     loadConfig();
+    loadWifiTestResults(); // cargar resultados previos del test WiFi (si existen)
 
-    /* ── WiFi: potencia máxima, sin sleep ──────────────────────── */
-    WiFi.persistent(false);          // no desgastar flash en cada reconexión
+    /* ── WiFi ──────────────────────── */
+    WiFi.persistent(false); // no desgastar flash en cada reconexión
     WiFi.hostname("extractor-esp");
-    WiFi.setSleepMode(WIFI_NONE_SLEEP);   // radio siempre activa — sin latencia
-    WiFi.setOutputPower(17.5f);
-    WiFi.setPhyMode(WIFI_PHY_MODE_11N);  // modo 802.11n para mejor rendimiento
+    WiFi.setSleepMode(WIFI_NONE_SLEEP); // radio siempre activa — sin latencia
+    WiFi.setOutputPower(gWtOrigPower);
+    WiFi.setPhyMode(WIFI_PHY_MODE_11B); // modo 802.11b para mejor cobertura
     WiFi.setAutoReconnect(true);
 
     /* ── Comprobar pin de forzado de portal ─────────────────────── */
@@ -1098,7 +1896,31 @@ void setup()
         startApMode();
     }
 
-    /* ── TelnetStream (solo útil en modo STA, en AP conectar al AP) */
+    /* --- Sincronización de hora --- */
+    configTime(0, 0, MY_NTP_SERVER);
+    configTzTime(MY_TZ, MY_NTP_SERVER);
+
+    LOG_PRINT(F("Sincronizando hora NTP..."));
+    int horaRetries = 0;
+    while (!getLocalTime(&timeinfo) && horaRetries < 10)
+    {
+        Serial.print(".");
+        delay(500);
+        horaRetries++;
+    }
+
+    if (horaRetries >= 10)
+    {
+        LOG_PRINTLN(F("\n[!] No se obtuvo hora. Usando timestamps relativos."));
+        timeOK = false;
+    }
+    else
+    {
+        timeOK = true;
+        LOG_PRINTLN(F("\n[OK] Hora sincronizada. Logs con fecha activa."));
+    }
+
+    // Telnet y WebServer
     TelnetStream.begin();
     telnetReady = true;
 
@@ -1115,7 +1937,12 @@ void setup()
     webServer.on("/set", handleSet);
     webServer.on("/log", handleLog);
     webServer.on("/log/clear", handleLogClear);
-    webServer.on("/wifi", handleWifiPortal); 
+    webServer.on("/wifi", handleWifiPortal);                // desconectar + AP + WiFiManager
+    webServer.on("/wifi/sta", handleWifiSta);               // cambiar WiFi desde conexión actual
+    webServer.on("/api/crash", handleCrashApi);             // info de crash/reset
+    webServer.on("/testwifi", handleTestWifi);              // página del test WiFi
+    webServer.on("/testwifi/run", handleTestWifiRun);       // disparar test
+    webServer.on("/testwifi/status", handleTestWifiStatus); // estado/resultados JSON
     webServer.begin();
     LOG_PRINTLN(F("WebServer iniciado en puerto 80."));
 
@@ -1196,19 +2023,21 @@ void loop()
         // Procesar peticiones DNS del captive portal
         dnsServer.processNextRequest();
 
-        // Cada 60 s intentar reconectar al WiFi
+        // Cada 3 min intentar reconectar al WiFi (manteniendo AP activo)
         if (millis() - tApReconnect >= INTERVAL_AP_RECONNECT)
         {
             tApReconnect = millis();
             LOG_PRINTLN(F("AP: probando reconexión WiFi..."));
 
-            dnsServer.stop();
-            WiFi.mode(WIFI_STA);
-            WiFi.begin(); // intenta con credenciales guardadas
+            // WIFI_AP_STA: mantenemos el AP activo mientras intentamos STA
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.softAP(AP_SSID, SECRET_AP_PASS); // re-asegurar AP
+            WiFi.begin();                         // intenta con credenciales guardadas
 
             unsigned long t = millis();
             while (WiFi.status() != WL_CONNECTED && millis() - t < 10000UL)
             {
+                dnsServer.processNextRequest(); // seguir sirviendo DNS
                 delay(200);
                 yield();
             }
@@ -1223,9 +2052,10 @@ void loop()
             }
             else
             {
-                // No conectó: volver al modo AP
+                // No conectó: volver al modo AP puro
                 LOG_PRINTLN(F("Sin WiFi — continuando en modo AP."));
                 WiFi.mode(WIFI_AP);
+                // El softAP ya estaba activo en WIFI_AP_STA — reconfirmar
                 WiFi.softAP(AP_SSID, SECRET_AP_PASS);
                 delay(100);
                 dnsServer.start(53, "*", WiFi.softAPIP());
@@ -1235,7 +2065,8 @@ void loop()
     else
     {
         /* ── Modo normal (STA): vigilar pérdida de WiFi ───────── */
-        if (WiFi.status() != WL_CONNECTED)
+        // Durante el test WiFi el watchdog se suspende: las desconexiones son intencionadas.
+        if (!gWtRunning && WiFi.status() != WL_CONNECTED)
         {
             if (!wifiWasLost)
             {
@@ -1255,8 +2086,15 @@ void loop()
                 webServer.begin();
             }
         }
+        else if (!gWtRunning)
+        {
+            wifiWasLost = false;
+        }
         else
         {
+            // Test en curso: resetear el temporizador continuamente para que
+            // al terminar el test no haya un disparo inmediato del watchdog.
+            tWifiLost = millis();
             wifiWasLost = false;
         }
     }
@@ -1265,6 +2103,9 @@ void loop()
     ArduinoOTA.handle();
     MDNS.update();
     webServer.handleClient();
+
+    /* ── WiFi Test: avanzar un paso de la state machine ─────────*/
+    runWifiTestStep();
 
     /* ── MQTT solo en modo normal (necesita acceso a internet/LAN)*/
     if (!gApMode)
