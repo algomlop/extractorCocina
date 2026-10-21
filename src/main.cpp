@@ -700,7 +700,13 @@ void evaluateAuto()
     {
         LOG_PRINTLN(gSchedActive ? F("Programación: ventana ACTIVA") : F("Programación: ventana terminada"));
         if (!gSchedActive)
+        {
             tExtractorOn = now; // reiniciar contador de "máx. encendido"
+            bool trig = (gENSValid && (float)gAQI >= gThresh1) ||
+                        gHumidity >= gThresh2 || gSoilHum >= gThresh3;
+            if (!trig)
+                setExtractor(false); // ningún sensor lo pide: apagar al acabar la ventana
+        }
         prevSched = gSchedActive;
     }
     if (gSchedActive)
@@ -1261,10 +1267,14 @@ function wifiPortal(){
 }
 buildSched(); refresh(); setInterval(refresh,8000);
 loadCrashInfo();
-</script></body></html>
+</script><br>v2.1</body></html>
 )html";
 
-void handleRoot() { webServer.send_P(200, "text/html", HTML); }
+void handleRoot()
+{
+    webServer.sendHeader("Cache-Control", "no-cache");
+    webServer.send_P(200, "text/html", HTML);
+}
 
 void handleApi()
 {
@@ -2213,6 +2223,7 @@ void setup()
     loadRTCCrash();
 
     LOG_PRINTLN(F("\n=== Extractor ESP8266 ==="));
+    LOG_PRINTLN(F("Build: " __DATE__ " " __TIME__));
 
     if (!LittleFS.begin())
     {
@@ -2239,8 +2250,9 @@ void setup()
         ESP.rtcUserMemoryWrite(0, (uint32_t *)&gCrashInfo, sizeof(gCrashInfo));
 
         if (isCrash)
-            LOG_PRINTF_P(PSTR("*** CRASH #%u detectado! Motivo: %s\n"),
-                         (unsigned)gCrashInfo.resetCount, rstReasonStr(reason));
+            LOG_PRINTF_P(PSTR("*** CRASH #%u detectado! Motivo: %s (exccause=%u epc1=0x%08x)\n"),
+                (unsigned)gCrashInfo.resetCount, rstReasonStr(reason),
+                (unsigned)gCrashInfo.exccause, ri ? (unsigned)ri->epc1 : 0u);
     }
 
     pinMode(PIN_SOIL_VCC, OUTPUT);
